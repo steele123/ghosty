@@ -9,6 +9,7 @@ use crate::models::PresenceStatus;
 
 const HELPER_PUUID: &str = "41c322a1-b328-495b-a004-5ccd3e45eae8";
 const HELPER_NAME: &str = "Ghosty Active!";
+const HELPER_PROFILE_ICON: &str = "784";
 pub const ROSTER_NAMESPACE: &str = "jabber:iq:riotgames:roster";
 
 pub enum PresenceRewrite {
@@ -202,16 +203,34 @@ fn roster_query_insert_at(content: &str) -> Option<usize> {
 
 pub fn helper_presence(helper_jid: &str, valorant_version: Option<&str>) -> String {
     let now = chrono::Utc::now().timestamp_millis();
+    let league_presence = helper_league_presence();
     let valorant_presence = helper_valorant_presence(valorant_version.unwrap_or("unknown"));
     format!(
         "<presence from='{helper_jid}/RC-Ghosty' id='ghosty-{now}'>\
          <games>\
          <keystone><st>chat</st><s.t>{now}</s.t><s.p>keystone</s.p><pty/></keystone>\
-         <league_of_legends><st>chat</st><s.t>{now}</s.t><s.p>league_of_legends</s.p><s.c>live</s.c><p>{{&quot;pty&quot;:true}}</p></league_of_legends>\
+         <league_of_legends><st>chat</st><s.t>{now}</s.t><s.r>NA1</s.r><s.p>league_of_legends</s.p><s.c>live</s.c><p>{league_presence}</p><pty/></league_of_legends>\
          <valorant><st>chat</st><s.t>{now}</s.t><s.p>valorant</s.p><s.r>PC</s.r><p>{valorant_presence}</p><pty/></valorant>\
          <bacon><st>chat</st><s.t>{now}</s.t><s.l>bacon_availability_online</s.l><s.p>bacon</s.p></bacon>\
          </games><show>chat</show><platform>riot</platform><status/></presence>"
     )
+}
+
+fn helper_league_presence() -> String {
+    let payload = format!(
+        r#"{{
+            "championId": "",
+            "gameQueueType": "",
+            "gameStatus": "outOfGame",
+            "level": "1",
+            "profileIcon": "{HELPER_PROFILE_ICON}",
+            "puuid": "{HELPER_PUUID}",
+            "queueId": null
+        }}"#
+    );
+    let encoded_json_string = serde_json::to_string(&payload)
+        .expect("helper League presence payload should serialize as JSON string");
+    STANDARD.encode(encoded_json_string)
 }
 
 fn helper_valorant_presence(version: &str) -> String {
@@ -575,6 +594,24 @@ mod tests {
         assert!(presence.contains("<league_of_legends>"));
         assert!(presence.contains("<valorant>"));
         assert!(presence.contains("<bacon>"));
+
+        let encoded = presence
+            .split("<league_of_legends>")
+            .nth(1)
+            .and_then(|league| league.split("<p>").nth(1))
+            .and_then(|payload| payload.split("</p>").next())
+            .expect("League payload should be present");
+        let decoded = String::from_utf8(
+            STANDARD
+                .decode(encoded)
+                .expect("League payload should be base64"),
+        )
+        .expect("League payload should be utf8");
+        let league_payload: String =
+            serde_json::from_str(&decoded).expect("League payload should be a JSON string");
+
+        assert!(league_payload.contains("\"profileIcon\": \"3151\""));
+        assert!(league_payload.contains("\"gameStatus\": \"outOfGame\""));
 
         let encoded = presence
             .split("<valorant>")
