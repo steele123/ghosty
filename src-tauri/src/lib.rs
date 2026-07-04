@@ -143,6 +143,30 @@ fn set_helper_friend(
 }
 
 #[tauri::command]
+fn set_auto_accept(
+    state: State<'_, SharedState>,
+    auto_accept: bool,
+) -> Result<AppSnapshot, String> {
+    let mut state = state.lock().map_err(|e| e.to_string())?;
+    state
+        .set_auto_accept(auto_accept)
+        .map_err(|e| e.to_string())?;
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+fn set_auto_accept_delay_ms(
+    state: State<'_, SharedState>,
+    delay_ms: u32,
+) -> Result<AppSnapshot, String> {
+    let mut state = state.lock().map_err(|e| e.to_string())?;
+    state
+        .set_auto_accept_delay_ms(delay_ms)
+        .map_err(|e| e.to_string())?;
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
 fn set_connect_to_muc(
     state: State<'_, SharedState>,
     connect_to_muc: bool,
@@ -190,6 +214,8 @@ pub fn run() {
             set_enabled,
             set_safe_mode,
             set_helper_friend,
+            set_auto_accept,
+            set_auto_accept_delay_ms,
             set_connect_to_muc,
             set_startup_status
         ])

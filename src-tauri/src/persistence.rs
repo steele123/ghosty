@@ -50,6 +50,32 @@ pub fn write_helper_friend(enabled: bool) -> Result<()> {
     write_string("helperFriend", if enabled { "true" } else { "false" })
 }
 
+pub fn read_auto_accept() -> bool {
+    read_string("autoAccept")
+        .as_deref()
+        .map(parse_bool)
+        .unwrap_or(false)
+}
+
+pub fn write_auto_accept(enabled: bool) -> Result<()> {
+    write_string("autoAccept", if enabled { "true" } else { "false" })
+}
+
+pub fn read_auto_accept_delay_ms() -> u32 {
+    read_string("autoAcceptDelayMs")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map(clamp_auto_accept_delay)
+        .unwrap_or(2_000)
+}
+
+pub fn write_auto_accept_delay_ms(delay_ms: u32) -> Result<()> {
+    write_string(
+        "autoAcceptDelayMs",
+        &clamp_auto_accept_delay(delay_ms).to_string(),
+    )
+}
+
 pub fn read_certificate() -> Option<Vec<u8>> {
     let mut path = data_dir().ok()?;
     path.push("localhostCert.pfx");
@@ -166,6 +192,10 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+fn clamp_auto_accept_delay(delay_ms: u32) -> u32 {
+    delay_ms.clamp(0, 10_000)
+}
+
 fn startup_status_text(status: StartupStatus) -> &'static str {
     match status {
         StartupStatus::Chat => "chat",
@@ -246,6 +276,12 @@ mod tests {
         for value in ["false", "0", "no", "off", "", "definitely"] {
             assert!(!parse_bool(value));
         }
+    }
+
+    #[test]
+    fn auto_accept_delay_is_clamped() {
+        assert_eq!(clamp_auto_accept_delay(500), 500);
+        assert_eq!(clamp_auto_accept_delay(99_999), 10_000);
     }
 
     fn assert_no_temp_files_for(path: &Path) {

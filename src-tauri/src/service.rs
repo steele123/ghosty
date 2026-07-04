@@ -23,6 +23,9 @@ use crate::{
     persistence, presence, riot,
 };
 
+#[cfg(not(test))]
+use crate::lcu_api;
+
 const STREAM_EVENT_PREVIEW_CHARS: usize = 1_400;
 const LOG_BUFFER_LIMIT: usize = 240;
 const STREAM_EVENT_BUFFER_LIMIT: usize = 800;
@@ -43,6 +46,9 @@ pub struct AppState {
     enabled: Arc<AtomicBool>,
     safe_mode: Arc<AtomicBool>,
     helper_friend: Arc<AtomicBool>,
+    auto_accept: Arc<AtomicBool>,
+    auto_accept_delay_ms: Arc<AtomicU32>,
+    auto_accept_state: Arc<Mutex<String>>,
     status: Arc<Mutex<PresenceStatus>>,
     startup_status: StartupStatus,
     connect_to_muc: Arc<AtomicBool>,
@@ -72,16 +78,39 @@ impl AppState {
             StartupStatus::Last => persistence::read_session_status(),
         };
 
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let auto_accept = Arc::new(AtomicBool::new(persistence::read_auto_accept()));
+        let auto_accept_delay_ms =
+            Arc::new(AtomicU32::new(persistence::read_auto_accept_delay_ms()));
+        let auto_accept_state = Arc::new(Mutex::new(
+            if auto_accept.load(Ordering::Relaxed) {
+                "Waiting for League Client"
+            } else {
+                "Disabled"
+            }
+            .to_string(),
+        ));
+        #[cfg(not(test))]
+        start_auto_accept_monitor(
+            auto_accept.clone(),
+            auto_accept_delay_ms.clone(),
+            auto_accept_state.clone(),
+            logs.clone(),
+        );
+
         Ok(Self {
             runtime: None,
             enabled: Arc::new(AtomicBool::new(true)),
             safe_mode: Arc::new(AtomicBool::new(false)),
             helper_friend: Arc::new(AtomicBool::new(persistence::read_helper_friend())),
+            auto_accept,
+            auto_accept_delay_ms,
+            auto_accept_state,
             status: Arc::new(Mutex::new(session_status)),
             startup_status,
             connect_to_muc: Arc::new(AtomicBool::new(true)),
             health: Arc::new(Mutex::new(ConnectionHealth::default())),
-            logs: Arc::new(Mutex::new(Vec::new())),
+            logs,
             stream_events: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -109,6 +138,13 @@ impl AppState {
             enabled: self.enabled.load(Ordering::Relaxed),
             safe_mode: self.safe_mode.load(Ordering::Relaxed),
             helper_friend: self.helper_friend.load(Ordering::Relaxed),
+            auto_accept: self.auto_accept.load(Ordering::Relaxed),
+            auto_accept_delay_ms: self.auto_accept_delay_ms.load(Ordering::Relaxed),
+            auto_accept_state: self
+                .auto_accept_state
+                .lock()
+                .map(|state| state.clone())
+                .unwrap_or_else(|_| "Unavailable".to_string()),
             status: status_value(&self.status),
             startup_status: self.startup_status,
             connect_to_muc: self.connect_to_muc.load(Ordering::Relaxed),
@@ -419,6 +455,33 @@ impl AppState {
         Ok(())
     }
 
+    pub fn set_auto_accept(&mut self, auto_accept: bool) -> Result<()> {
+        persistence::write_auto_accept(auto_accept)?;
+        self.auto_accept.store(auto_accept, Ordering::Relaxed);
+        set_auto_accept_state(
+            &self.auto_accept_state,
+            if auto_accept {
+                "Watching for ready check"
+            } else {
+                "Disabled"
+            },
+        );
+        self.push_log(if auto_accept {
+            "Auto accept enabled"
+        } else {
+            "Auto accept disabled"
+        });
+        Ok(())
+    }
+
+    pub fn set_auto_accept_delay_ms(&mut self, delay_ms: u32) -> Result<()> {
+        let delay_ms = delay_ms.clamp(0, 10_000);
+        persistence::write_auto_accept_delay_ms(delay_ms)?;
+        self.auto_accept_delay_ms.store(delay_ms, Ordering::Relaxed);
+        self.push_log(format!("Auto accept delay set to {delay_ms}ms"));
+        Ok(())
+    }
+
     pub fn set_connect_to_muc(&mut self, connect_to_muc: bool) {
         self.connect_to_muc.store(connect_to_muc, Ordering::Relaxed);
         self.push_log(if connect_to_muc {
@@ -480,6 +543,133 @@ impl AppState {
         if let Ok(mut health) = self.health.lock() {
             *health = ConnectionHealth::default();
         }
+    }
+}
+
+#[cfg(not(test))]
+fn start_auto_accept_monitor(
+    enabled: Arc<AtomicBool>,
+    delay_ms: Arc<AtomicU32>,
+    state: Arc<Mutex<String>>,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
+) {
+    thread::spawn(move || {
+        let mut ready_check_active = false;
+        let mut last_phase = String::new();
+
+        loop {
+            if !enabled.load(Ordering::Relaxed) {
+                ready_check_active = false;
+                set_auto_accept_state(&state, "Disabled");
+                thread::sleep(Duration::from_millis(750));
+                continue;
+            }
+
+            match lcu_api::gameflow_phase() {
+                Ok(phase) => {
+                    if phase != last_phase {
+                        last_phase = phase.clone();
+                        if phase != "ReadyCheck" {
+                            set_auto_accept_state(&state, format!("Watching: {phase}"));
+                        }
+                    }
+
+                    if phase == "ReadyCheck" {
+                        if !ready_check_active {
+                            ready_check_active = true;
+                            let delay = delay_ms.load(Ordering::Relaxed);
+                            set_auto_accept_state(
+                                &state,
+                                format!("Ready check found; accepting in {delay}ms"),
+                            );
+                            push_log_to(
+                                &logs,
+                                LogCategory::System,
+                                LogLevel::Info,
+                                format!("Auto accept detected ready check; accepting in {delay}ms"),
+                            );
+                            sleep_auto_accept_delay(&enabled, delay);
+                            if enabled.load(Ordering::Relaxed) {
+                                match lcu_api::accept_ready_check() {
+                                    Ok(response) if response.ok => {
+                                        set_auto_accept_state(&state, "Accepted ready check");
+                                        push_log_to(
+                                            &logs,
+                                            LogCategory::System,
+                                            LogLevel::Info,
+                                            "Auto accepted ready check",
+                                        );
+                                    }
+                                    Ok(response) => {
+                                        set_auto_accept_state(
+                                            &state,
+                                            format!("Accept returned HTTP {}", response.status),
+                                        );
+                                        push_log_to(
+                                            &logs,
+                                            LogCategory::System,
+                                            LogLevel::Warn,
+                                            format!(
+                                                "Auto accept returned HTTP {}",
+                                                response.status
+                                            ),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        set_auto_accept_state(&state, "Accept failed");
+                                        push_log_to(
+                                            &logs,
+                                            LogCategory::System,
+                                            LogLevel::Warn,
+                                            format!("Auto accept failed: {error:#}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(250));
+                    } else {
+                        ready_check_active = false;
+                        thread::sleep(Duration::from_millis(750));
+                    }
+                }
+                Err(_) => {
+                    ready_check_active = false;
+                    last_phase.clear();
+                    set_auto_accept_state(&state, "Waiting for League Client");
+                    thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn sleep_auto_accept_delay(enabled: &Arc<AtomicBool>, delay_ms: u32) {
+    let mut remaining = delay_ms;
+    while remaining > 0 && enabled.load(Ordering::Relaxed) {
+        let step = remaining.min(100);
+        thread::sleep(Duration::from_millis(u64::from(step)));
+        remaining -= step;
+    }
+}
+
+fn set_auto_accept_state(state: &Arc<Mutex<String>>, value: impl Into<String>) {
+    if let Ok(mut state) = state.lock() {
+        *state = value.into();
+    }
+}
+
+#[cfg(not(test))]
+fn push_log_to(
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+    category: LogCategory,
+    level: LogLevel,
+    message: impl Into<String>,
+) {
+    if let Ok(mut logs) = logs.lock() {
+        logs.push(LogEntry::new(category, level, message.into()));
+        keep_recent(&mut logs);
     }
 }
 
@@ -2685,6 +2875,9 @@ mod tests {
             enabled: Arc::new(AtomicBool::new(true)),
             safe_mode: Arc::new(AtomicBool::new(false)),
             helper_friend: Arc::new(AtomicBool::new(false)),
+            auto_accept: Arc::new(AtomicBool::new(false)),
+            auto_accept_delay_ms: Arc::new(AtomicU32::new(2_000)),
+            auto_accept_state: Arc::new(Mutex::new("Disabled".to_string())),
             status: Arc::new(Mutex::new(PresenceStatus::Offline)),
             startup_status: StartupStatus::Last,
             connect_to_muc: Arc::new(AtomicBool::new(true)),

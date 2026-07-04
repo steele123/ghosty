@@ -56,6 +56,24 @@ pub fn call_endpoint(method: &str, endpoint: &str, body: Option<Value>) -> Resul
     })
 }
 
+#[cfg(not(test))]
+pub fn gameflow_phase() -> Result<String> {
+    let response = call_endpoint("GET", "/lol-gameflow/v1/gameflow-phase", None)?;
+    if let Some(Value::String(phase)) = response.body {
+        return Ok(phase);
+    }
+    Ok(response.text.trim_matches('"').to_string())
+}
+
+#[cfg(not(test))]
+pub fn accept_ready_check() -> Result<LcuApiResponse> {
+    call_endpoint(
+        "POST",
+        "/lol-matchmaking/v1/ready-check/accept",
+        Some(serde_json::json!({})),
+    )
+}
+
 fn build_client(auth: &LcuAuthInfo) -> Result<Client> {
     let mut headers = header::HeaderMap::new();
     let encoded = STANDARD.encode(format!("riot:{}", auth.password));
