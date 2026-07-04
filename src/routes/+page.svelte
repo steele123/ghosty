@@ -53,6 +53,13 @@
     message: string;
   };
 
+  type StreamEvent = {
+    timestamp: string;
+    direction: string;
+    bytes: number;
+    preview: string;
+  };
+
   type PreflightReport = {
     ok: boolean;
     checks: Array<{ label: string; ok: boolean; detail: string }>;
@@ -75,6 +82,7 @@
     activeGame: LaunchGame | null;
     activeGameLabel: string | null;
     logs: LogEntry[];
+    streamEvents: StreamEvent[];
   };
 
   const games: Array<{ id: LaunchGame; label: string; hint: string }> = [
@@ -114,7 +122,8 @@
     riotClientPath: null,
     activeGame: null,
     activeGameLabel: null,
-    logs: []
+    logs: [],
+    streamEvents: []
   });
   let selectedGame = $state<LaunchGame>("lol");
   let gamePatchline = $state("live");
@@ -294,6 +303,16 @@
     });
   }
 
+  async function copyStreamEvents() {
+    const text = snapshot.streamEvents
+      .map((event) => `[${event.timestamp}] ${event.direction} ${event.bytes} bytes: ${event.preview}`)
+      .join("\n");
+    await call(async () => {
+      await navigator.clipboard.writeText(text);
+      notice = snapshot.streamEvents.length ? "Copied event stream to clipboard." : "Copied empty event stream.";
+    });
+  }
+
   function minimizeWindow() {
     void appWindow.minimize();
   }
@@ -350,6 +369,10 @@
   function filteredLogs() {
     const logs = logFilter === "all" ? snapshot.logs : snapshot.logs.filter((line) => line.category === logFilter);
     return logs.slice().reverse();
+  }
+
+  function streamEvents() {
+    return snapshot.streamEvents.slice().reverse();
   }
 
   function selectGame(game: LaunchGame) {
@@ -712,7 +735,7 @@
       <div class="log">
         {#if filteredLogs().length}
           {#each filteredLogs() as line}
-            <p data-level={line.level}>
+            <p data-category={line.category} data-level={line.level}>
               <span>{line.timestamp}</span>
               <b>{line.category}</b>
               {line.message}
@@ -720,6 +743,30 @@
           {/each}
         {:else}
           <p>No proxy events yet.</p>
+        {/if}
+      </div>
+    </div>
+
+    <div class="panel log-panel event-stream-panel">
+      <div class="panel-title">
+        <Activity size={18} />
+        <h2>Event Stream</h2>
+        <button class="icon-action" disabled={busy} type="button" title="Copy event stream" onclick={() => runAction(copyStreamEvents)}>
+          <Clipboard size={16} />
+        </button>
+      </div>
+      <div class="log stream-log">
+        {#if streamEvents().length}
+          {#each streamEvents() as event}
+            <p>
+              <span>{event.timestamp}</span>
+              <b>{event.direction}</b>
+              <em>{event.bytes} bytes</em>
+              {event.preview}
+            </p>
+          {/each}
+        {:else}
+          <p>No stream events yet.</p>
         {/if}
       </div>
     </div>
@@ -1356,14 +1403,24 @@
   }
 
   .log p span,
-  .log p b {
+  .log p b,
+  .log p em {
     margin-right: 7px;
     color: #8ea0b4;
     font-weight: 800;
+    font-style: normal;
   }
 
   .log p b {
     color: #9dbfe8;
+  }
+
+  .stream-log p {
+    color: #b8ead4;
+  }
+
+  .stream-log p b {
+    color: #78d1a9;
   }
 
   @media (max-width: 860px) {

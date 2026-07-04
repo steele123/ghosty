@@ -18,10 +18,14 @@ use crate::{
     config_proxy::{self, PatchedChatServer, LOCALHOST_DOMAIN},
     models::{
         AppSnapshot, ConnectionHealth, HealthState, HealthStep, LaunchGame, LogCategory, LogEntry,
-        LogLevel, PreflightCheck, PreflightReport, PresenceStatus, StartupStatus,
+        LogLevel, PreflightCheck, PreflightReport, PresenceStatus, StartupStatus, StreamEvent,
     },
     persistence, presence, riot,
 };
+
+const STREAM_EVENT_PREVIEW_CHARS: usize = 1_400;
+const LOG_BUFFER_LIMIT: usize = 240;
+const STREAM_EVENT_BUFFER_LIMIT: usize = 800;
 
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -42,6 +46,7 @@ pub struct AppState {
     connect_to_muc: Arc<AtomicBool>,
     health: Arc<Mutex<ConnectionHealth>>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
+    stream_events: Arc<Mutex<Vec<StreamEvent>>>,
 }
 
 struct ServiceRuntime {
@@ -75,6 +80,7 @@ impl AppState {
             connect_to_muc: Arc::new(AtomicBool::new(true)),
             health: Arc::new(Mutex::new(ConnectionHealth::default())),
             logs: Arc::new(Mutex::new(Vec::new())),
+            stream_events: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -119,6 +125,11 @@ impl AppState {
                 .lock()
                 .map(|logs| logs.clone())
                 .unwrap_or_default(),
+            stream_events: self
+                .stream_events
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -146,7 +157,9 @@ impl AppState {
         let reconnect_attempts = Arc::new(AtomicU32::new(0));
         let (patched_tx, patched_rx) = mpsc::channel();
         let (log_tx, log_rx) = mpsc::channel();
+        let (stream_tx, stream_rx) = mpsc::channel();
         pump_logs(log_rx, self.logs.clone());
+        pump_stream_events(stream_rx, self.stream_events.clone());
 
         let chat_listener =
             TcpListener::bind(("127.0.0.1", 0)).context("Unable to bind chat proxy")?;
@@ -266,6 +279,7 @@ impl AppState {
                     active_connections: runtime_connections,
                     reconnect_attempts: runtime_reconnects,
                     log_tx,
+                    stream_tx,
                 };
                 serve_chat(chat_listener, chat_context);
                 return;
@@ -481,6 +495,7 @@ struct ChatProxyContext {
     active_connections: Arc<AtomicUsize>,
     reconnect_attempts: Arc<AtomicU32>,
     log_tx: Sender<LogEntry>,
+    stream_tx: Sender<StreamEvent>,
 }
 
 fn serve_chat(listener: TcpListener, context: ChatProxyContext) {
@@ -600,11 +615,17 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
     let mut buffer = [0_u8; 16 * 1024];
     let mut logged_client_flow = false;
     let mut logged_server_flow = false;
+    let mut logged_client_presence = false;
+    let mut logged_server_presence = false;
     let mut inserted_helper_friend = false;
     let mut sent_helper_presence = false;
+    let mut refreshed_helper_presence_after_client_presence = false;
     let mut sent_helper_intro = false;
     let mut logged_roster_without_helper = false;
-    let helper_jid = presence::helper_jid_for_chat_host(&context.server.host);
+    let helper_jid = presence::helper_jid_for_chat_identity(
+        &context.server.host,
+        context.server.affinity.as_deref(),
+    );
     let mut helper_injector = HelperFriendInjector::new(helper_jid.clone());
     let mut helper_command_buffer = HelperCommandBuffer::new(helper_jid.clone());
     let mut presence_buffer = ClientPresenceBuffer::new();
@@ -655,6 +676,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
         match read_bytes(&mut incoming, &mut buffer)? {
             StreamRead::Data(bytes) => {
                 made_progress = true;
+                log_stream_bytes(&context.stream_tx, "client -> ghosty", &bytes);
                 if !logged_client_flow {
                     logged_client_flow = true;
                     log(
@@ -665,8 +687,10 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     );
                 }
                 let previous_valorant_version = valorant_version.clone();
+                let mut saw_client_presence = false;
                 match incoming_text_buffer.push(bytes) {
                     Utf8Chunk::Text { content, bytes } if helper_friend_enabled => {
+                        saw_client_presence = content.contains("<presence");
                         match helper_command_buffer.push(
                             &content,
                             &context.enabled,
@@ -696,10 +720,14 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                                     )?;
                                 }
                                 if let Some(reply) = reply {
-                                    incoming.write_all(
-                                        presence::helper_chat_message(&helper_jid, &reply)
-                                            .as_bytes(),
-                                    )?;
+                                    let message =
+                                        presence::helper_chat_message(&helper_jid, &reply);
+                                    log_stream_bytes(
+                                        &context.stream_tx,
+                                        "ghosty -> client helper message",
+                                        message.as_bytes(),
+                                    );
+                                    incoming.write_all(message.as_bytes())?;
                                 }
                             }
                         }
@@ -707,6 +735,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     Utf8Chunk::Text { content, bytes }
                         if !context.safe_mode.load(Ordering::Relaxed) =>
                     {
+                        saw_client_presence = content.contains("<presence");
                         forward_client_chat(
                             &content,
                             &bytes,
@@ -719,15 +748,19 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     Utf8Chunk::Text { bytes, .. } => {
                         let pending = presence_buffer.flush();
                         if !pending.is_empty() {
+                            log_stream_bytes(&context.stream_tx, "ghosty -> riot", &pending);
                             outgoing.write_all(&pending)?;
                         }
+                        log_stream_bytes(&context.stream_tx, "ghosty -> riot", &bytes);
                         outgoing.write_all(&bytes)?;
                     }
                     Utf8Chunk::Binary(bytes) => {
                         let pending = presence_buffer.flush();
                         if !pending.is_empty() {
+                            log_stream_bytes(&context.stream_tx, "ghosty -> riot", &pending);
                             outgoing.write_all(&pending)?;
                         }
+                        log_stream_bytes(&context.stream_tx, "ghosty -> riot", &bytes);
                         outgoing.write_all(&bytes)?;
                     }
                     Utf8Chunk::Pending => {}
@@ -735,13 +768,39 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                 if helper_friend_enabled
                     && inserted_helper_friend
                     && sent_helper_presence
+                    && saw_client_presence
+                    && !refreshed_helper_presence_after_client_presence
+                {
+                    refreshed_helper_presence_after_client_presence = true;
+                    let helper_presence =
+                        presence::helper_presence(&helper_jid, valorant_version.as_deref());
+                    log_stream_bytes(
+                        &context.stream_tx,
+                        "ghosty -> client helper presence refresh",
+                        helper_presence.as_bytes(),
+                    );
+                    incoming.write_all(helper_presence.as_bytes())?;
+                    log(
+                        &context.log_tx,
+                        LogCategory::Chat,
+                        LogLevel::Info,
+                        "Refreshed Ghosty helper friend presence after client presence",
+                    );
+                }
+                if helper_friend_enabled
+                    && inserted_helper_friend
+                    && sent_helper_presence
                     && valorant_version.is_some()
                     && valorant_version != previous_valorant_version
                 {
-                    incoming.write_all(
-                        presence::helper_presence(&helper_jid, valorant_version.as_deref())
-                            .as_bytes(),
-                    )?;
+                    let helper_presence =
+                        presence::helper_presence(&helper_jid, valorant_version.as_deref());
+                    log_stream_bytes(
+                        &context.stream_tx,
+                        "ghosty -> client helper presence update",
+                        helper_presence.as_bytes(),
+                    );
+                    incoming.write_all(helper_presence.as_bytes())?;
                     log(
                         &context.log_tx,
                         LogCategory::Chat,
@@ -749,14 +808,25 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                         "Updated Ghosty helper friend presence",
                     );
                 }
+                if saw_client_presence && !logged_client_presence {
+                    logged_client_presence = true;
+                    log(
+                        &context.log_tx,
+                        LogCategory::Chat,
+                        LogLevel::Info,
+                        "Client-to-server presence stanzas are flowing",
+                    );
+                }
             }
             StreamRead::Closed => {
                 let pending = incoming_text_buffer.flush();
                 if !pending.is_empty() {
+                    log_stream_bytes(&context.stream_tx, "ghosty -> riot", &pending);
                     outgoing.write_all(&pending)?;
                 }
                 let pending = presence_buffer.flush();
                 if !pending.is_empty() {
+                    log_stream_bytes(&context.stream_tx, "ghosty -> riot", &pending);
                     outgoing.write_all(&pending)?;
                 }
                 return Err(CleanConnectionClose.into());
@@ -767,10 +837,20 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
         match read_bytes(&mut outgoing, &mut buffer)? {
             StreamRead::Data(bytes) => {
                 made_progress = true;
+                log_stream_bytes(&context.stream_tx, "riot -> ghosty", &bytes);
                 let mut bytes_to_client = Vec::new();
                 match outgoing_text_buffer.push(bytes) {
                     Utf8Chunk::Text { content, bytes } => {
                         bytes_to_client = bytes;
+                        if content.contains("<presence") && !logged_server_presence {
+                            logged_server_presence = true;
+                            log(
+                                &context.log_tx,
+                                LogCategory::Chat,
+                                LogLevel::Info,
+                                "Server-to-client presence stanzas are flowing",
+                            );
+                        }
                         if helper_friend_enabled && !inserted_helper_friend {
                             let injection = helper_injector.push(&content);
                             if injection.inserted {
@@ -807,21 +887,29 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     Utf8Chunk::Pending => {}
                 }
                 if !bytes_to_client.is_empty() {
+                    log_stream_bytes(&context.stream_tx, "ghosty -> client", &bytes_to_client);
                     incoming.write_all(&bytes_to_client)?;
                 }
                 if helper_friend_enabled && inserted_helper_friend && !sent_helper_presence {
                     sent_helper_presence = true;
-                    incoming.write_all(
-                        presence::helper_presence(&helper_jid, valorant_version.as_deref())
-                            .as_bytes(),
-                    )?;
-                    incoming.write_all(
-                        presence::helper_chat_message(
-                            &helper_jid,
-                            &helper_intro_message(&context.enabled, &context.status),
-                        )
-                        .as_bytes(),
-                    )?;
+                    let helper_presence =
+                        presence::helper_presence(&helper_jid, valorant_version.as_deref());
+                    log_stream_bytes(
+                        &context.stream_tx,
+                        "ghosty -> client helper presence",
+                        helper_presence.as_bytes(),
+                    );
+                    incoming.write_all(helper_presence.as_bytes())?;
+                    let helper_message = presence::helper_chat_message(
+                        &helper_jid,
+                        &helper_intro_message(&context.enabled, &context.status),
+                    );
+                    log_stream_bytes(
+                        &context.stream_tx,
+                        "ghosty -> client helper message",
+                        helper_message.as_bytes(),
+                    );
+                    incoming.write_all(helper_message.as_bytes())?;
                     sent_helper_intro = true;
                     log(
                         &context.log_tx,
@@ -834,13 +922,16 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     && sent_helper_presence
                     && !sent_helper_intro
                 {
-                    incoming.write_all(
-                        presence::helper_chat_message(
-                            &helper_jid,
-                            &helper_intro_message(&context.enabled, &context.status),
-                        )
-                        .as_bytes(),
-                    )?;
+                    let helper_message = presence::helper_chat_message(
+                        &helper_jid,
+                        &helper_intro_message(&context.enabled, &context.status),
+                    );
+                    log_stream_bytes(
+                        &context.stream_tx,
+                        "ghosty -> client helper message",
+                        helper_message.as_bytes(),
+                    );
+                    incoming.write_all(helper_message.as_bytes())?;
                     sent_helper_intro = true;
                     log(
                         &context.log_tx,
@@ -872,6 +963,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     pending = helper_pending;
                 }
                 if !pending.is_empty() {
+                    log_stream_bytes(&context.stream_tx, "ghosty -> client", &pending);
                     incoming.write_all(&pending)?;
                 }
                 return Err(CleanConnectionClose.into());
@@ -1019,8 +1111,10 @@ fn forward_client_chat(
     if context.safe_mode.load(Ordering::Relaxed) {
         let pending = presence_buffer.flush();
         if !pending.is_empty() {
+            log_stream_bytes(&context.stream_tx, "ghosty -> riot", &pending);
             outgoing.write_all(&pending)?;
         }
+        log_stream_bytes(&context.stream_tx, "ghosty -> riot", bytes);
         outgoing.write_all(bytes)?;
         return Ok(());
     }
@@ -1033,6 +1127,7 @@ fn forward_client_chat(
         valorant_version,
     )?;
     if !bytes.is_empty() {
+        log_stream_bytes(&context.stream_tx, "ghosty -> riot", &bytes);
         outgoing.write_all(&bytes)?;
     }
 
@@ -1669,15 +1764,154 @@ fn pump_logs(rx: mpsc::Receiver<LogEntry>, logs: Arc<Mutex<Vec<LogEntry>>>) {
     });
 }
 
+fn pump_stream_events(rx: mpsc::Receiver<StreamEvent>, events: Arc<Mutex<Vec<StreamEvent>>>) {
+    thread::spawn(move || {
+        while let Ok(event) = rx.recv() {
+            if let Ok(mut events) = events.lock() {
+                events.push(event);
+                keep_recent_stream_events(&mut events);
+            }
+        }
+    });
+}
+
 fn keep_recent(logs: &mut Vec<LogEntry>) {
-    if logs.len() > 240 {
-        let extra = logs.len() - 240;
+    if logs.len() > LOG_BUFFER_LIMIT {
+        let extra = logs.len() - LOG_BUFFER_LIMIT;
         logs.drain(0..extra);
+    }
+}
+
+fn keep_recent_stream_events(events: &mut Vec<StreamEvent>) {
+    if events.len() > STREAM_EVENT_BUFFER_LIMIT {
+        let extra = events.len() - STREAM_EVENT_BUFFER_LIMIT;
+        events.drain(0..extra);
     }
 }
 
 fn log(tx: &Sender<LogEntry>, category: LogCategory, level: LogLevel, message: impl Into<String>) {
     let _ = tx.send(LogEntry::new(category, level, message.into()));
+}
+
+fn log_stream_bytes(tx: &Sender<StreamEvent>, direction: &str, bytes: &[u8]) {
+    let preview = stream_preview(bytes);
+    let _ = tx.send(StreamEvent::new(direction, bytes.len(), preview));
+}
+
+fn stream_preview(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    let sanitized = sanitize_stream_text(&text);
+    let mut preview: String = sanitized.chars().take(STREAM_EVENT_PREVIEW_CHARS).collect();
+    if sanitized.chars().count() > STREAM_EVENT_PREVIEW_CHARS {
+        preview.push_str(" ... [truncated]");
+    }
+    preview
+}
+
+fn sanitize_stream_text(text: &str) -> String {
+    let mut sanitized = text
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    sanitized = redact_xml_element(&sanitized, "auth");
+    sanitized = redact_xml_element(&sanitized, "password");
+    sanitized = redact_attribute(&sanitized, "password");
+    sanitized = redact_attribute(&sanitized, "token");
+    sanitized = redact_attribute(&sanitized, "access_token");
+    sanitized
+}
+
+fn redact_xml_element(text: &str, tag: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    let open_marker = format!("<{tag}");
+    let close_marker = format!("</{tag}>");
+
+    while let Some(start) = remaining.find(&open_marker) {
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start..];
+        let Some(open_end) = after_start.find('>') else {
+            output.push_str(after_start);
+            return output;
+        };
+        let element_start = start + open_end + 1;
+        output.push_str(&remaining[start..element_start]);
+        let after_open = &remaining[element_start..];
+        if let Some(close_start) = after_open.find(&close_marker) {
+            output.push_str("[redacted]");
+            output.push_str(&after_open[close_start..close_start + close_marker.len()]);
+            remaining = &after_open[close_start + close_marker.len()..];
+        } else {
+            output.push_str("[redacted]");
+            return output;
+        }
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn redact_attribute(text: &str, attr: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    loop {
+        let Some(start) = find_attribute_start(remaining, attr) else {
+            output.push_str(remaining);
+            return output;
+        };
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start..];
+        let Some(eq_index) = after_start.find('=') else {
+            output.push_str(after_start);
+            return output;
+        };
+        let after_eq = &after_start[eq_index + 1..];
+        let Some(quote) = after_eq
+            .chars()
+            .next()
+            .filter(|ch| *ch == '"' || *ch == '\'')
+        else {
+            output.push_str(&after_start[..=eq_index]);
+            remaining = after_eq;
+            continue;
+        };
+        let quote_len = quote.len_utf8();
+        let value_start = eq_index + 1 + quote_len;
+        output.push_str(&after_start[..value_start]);
+        if let Some(value_end) = after_start[value_start..].find(quote) {
+            output.push_str("[redacted]");
+            output.push(quote);
+            remaining = &after_start[value_start + value_end + quote_len..];
+        } else {
+            output.push_str("[redacted]");
+            return output;
+        }
+    }
+}
+
+fn find_attribute_start(text: &str, attr: &str) -> Option<usize> {
+    let attr_lower = attr.to_ascii_lowercase();
+    let text_lower = text.to_ascii_lowercase();
+    let mut offset = 0;
+
+    while let Some(found) = text_lower[offset..].find(&attr_lower) {
+        let index = offset + found;
+        let before = text[..index].chars().next_back();
+        let after = text[index + attr.len()..].chars().next();
+        if before.is_none_or(|ch| ch.is_whitespace() || ch == '<')
+            && after.is_some_and(|ch| ch.is_whitespace() || ch == '=')
+        {
+            return Some(index);
+        }
+        offset = index + attr.len();
+    }
+
+    None
 }
 
 fn set_health(health: &Arc<Mutex<ConnectionHealth>>, update: impl FnOnce(&mut ConnectionHealth)) {
@@ -1814,6 +2048,17 @@ impl LogEntry {
     }
 }
 
+impl StreamEvent {
+    fn new(direction: &str, bytes: usize, preview: String) -> Self {
+        Self {
+            timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+            direction: direction.to_string(),
+            bytes,
+            preview,
+        }
+    }
+}
+
 struct ActiveConnectionGuard {
     active_connections: Arc<AtomicUsize>,
     health: Arc<Mutex<ConnectionHealth>>,
@@ -1864,6 +2109,7 @@ mod tests {
             connect_to_muc: Arc::new(AtomicBool::new(true)),
             health: Arc::new(Mutex::new(ConnectionHealth::default())),
             logs: Arc::new(Mutex::new(Vec::new())),
+            stream_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 

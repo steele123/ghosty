@@ -9,7 +9,6 @@ use crate::models::PresenceStatus;
 
 const HELPER_PUUID: &str = "41c322a1-b328-495b-a004-5ccd3e45eae8";
 const HELPER_NAME: &str = "Ghosty Active!";
-const HELPER_PROFILE_ICON_ID: &str = "1";
 pub const ROSTER_NAMESPACE: &str = "jabber:iq:riotgames:roster";
 
 pub enum PresenceRewrite {
@@ -78,12 +77,18 @@ pub fn rewrite_presence_fragment(
     }
 }
 
-pub fn helper_jid_for_chat_host(host: &str) -> String {
-    let affinity = host
-        .split('.')
-        .next()
+pub fn helper_jid_for_chat_identity(host: &str, affinity: Option<&str>) -> String {
+    let affinity = affinity
+        .map(str::trim)
         .filter(|affinity| !affinity.is_empty())
-        .unwrap_or("eu1");
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            host.split('.')
+                .next()
+                .filter(|affinity| !affinity.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "eu1".to_string());
     format!("{HELPER_PUUID}@{affinity}.pvp.net")
 }
 
@@ -252,12 +257,12 @@ fn rewrite_presence(
 
 fn helper_roster_item(helper_jid: &str) -> String {
     format!(
-        "<item jid='{helper_jid}' name='&#9;{HELPER_NAME}' subscription='both' puuid='{HELPER_PUUID}' profileIconId='{HELPER_PROFILE_ICON_ID}' icon='{HELPER_PROFILE_ICON_ID}'>\
+        "<item jid='{helper_jid}' name='&#9;{HELPER_NAME}' subscription='both' puuid='{HELPER_PUUID}'>\
          <group priority='9999'>Ghosty</group>\
          <state>online</state>\
-         <id name='&#9;{HELPER_NAME}' tagline='...' profileIconId='{HELPER_PROFILE_ICON_ID}' icon='{HELPER_PROFILE_ICON_ID}'/>\
-         <lol name='&#9;{HELPER_NAME}' profileIconId='{HELPER_PROFILE_ICON_ID}' icon='{HELPER_PROFILE_ICON_ID}'/>\
-         <platforms><riot name='&#9;Ghosty Active' tagline='...' profileIconId='{HELPER_PROFILE_ICON_ID}' icon='{HELPER_PROFILE_ICON_ID}'/></platforms>\
+         <id name='&#9;{HELPER_NAME}' tagline='...'/>\
+         <lol name='&#9;{HELPER_NAME}'/>\
+         <platforms><riot name='&#9;Ghosty Active' tagline='...'/></platforms>\
          </item>"
     )
 }
@@ -330,13 +335,17 @@ mod tests {
     const TEST_HELPER_JID: &str = "41c322a1-b328-495b-a004-5ccd3e45eae8@na2.pvp.net";
 
     #[test]
-    fn derives_helper_jid_from_chat_host_affinity() {
+    fn derives_helper_jid_from_chat_identity() {
         assert_eq!(
-            helper_jid_for_chat_host("na2.chat.si.riotgames.com"),
+            helper_jid_for_chat_identity("na2.chat.si.riotgames.com", None),
             TEST_HELPER_JID
         );
         assert_eq!(
-            helper_jid_for_chat_host(""),
+            helper_jid_for_chat_identity("na2.chat.si.riotgames.com", Some("na1")),
+            "41c322a1-b328-495b-a004-5ccd3e45eae8@na1.pvp.net"
+        );
+        assert_eq!(
+            helper_jid_for_chat_identity("", None),
             "41c322a1-b328-495b-a004-5ccd3e45eae8@eu1.pvp.net"
         );
     }
@@ -367,13 +376,11 @@ mod tests {
         let item = helper_roster_item(TEST_HELPER_JID);
 
         assert!(item.contains("name='&#9;Ghosty Active!'"));
-        assert!(item.contains("profileIconId='1'"));
-        assert!(item.contains("icon='1'"));
         assert!(item.contains("<group priority='9999'>Ghosty</group>"));
         assert!(item.contains("<state>online</state>"));
-        assert!(item.contains("<lol name='&#9;Ghosty Active!' profileIconId='1' icon='1'/>"));
+        assert!(item.contains("<lol name='&#9;Ghosty Active!'/>"));
         assert!(
-            item.contains("<platforms><riot name='&#9;Ghosty Active' tagline='...' profileIconId='1' icon='1'/></platforms>")
+            item.contains("<platforms><riot name='&#9;Ghosty Active' tagline='...'/></platforms>")
         );
     }
 

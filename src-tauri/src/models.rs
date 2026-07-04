@@ -78,6 +78,7 @@ pub struct AppSnapshot {
     pub active_game: Option<LaunchGame>,
     pub active_game_label: Option<String>,
     pub logs: Vec<LogEntry>,
+    pub stream_events: Vec<StreamEvent>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,6 +137,15 @@ pub struct LogEntry {
     pub level: LogLevel,
     pub category: LogCategory,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamEvent {
+    pub timestamp: String,
+    pub direction: String,
+    pub bytes: usize,
+    pub preview: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

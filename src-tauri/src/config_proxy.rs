@@ -36,6 +36,7 @@ const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 pub struct PatchedChatServer {
     pub host: String,
     pub port: u16,
+    pub affinity: Option<String>,
 }
 
 pub fn start(
@@ -172,9 +173,13 @@ fn handle_request(
 
     if status.is_success() {
         if let Ok(mut json) = serde_json::from_slice::<Value>(&body) {
-            if let Some(server) =
-                rewrite_config(&mut json, chat_port, client, headers.get("authorization"))
-            {
+            if let Some(server) = rewrite_config(
+                &mut json,
+                chat_port,
+                client,
+                headers.get("authorization"),
+                &log_tx,
+            ) {
                 send_patched_server_if_running(&running, &patched_tx, server);
             }
             body = serde_json::to_vec(&json)?;
@@ -374,13 +379,36 @@ fn rewrite_config(
     chat_port: u16,
     client: &Client,
     authorization: Option<&String>,
+    log_tx: &Sender<LogEntry>,
 ) -> Option<PatchedChatServer> {
     let affinity = if json
         .get("chat.affinity.enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        authorization.and_then(|auth| player_affinity(client, auth).ok())
+        match authorization {
+            Some(auth) => match player_affinity(client, auth) {
+                Ok(affinity) => {
+                    log_config(log_tx, format!("Using Riot chat affinity: {affinity}"));
+                    Some(affinity)
+                }
+                Err(error) => {
+                    log_warn(
+                        log_tx,
+                        format!("Unable to resolve Riot chat affinity: {error:#}"),
+                    );
+                    None
+                }
+            },
+            None => {
+                log_warn(
+                    log_tx,
+                    "Riot chat affinity was enabled but no authorization header was present"
+                        .to_string(),
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -402,7 +430,11 @@ fn rewrite_config_with_affinity(
     let server = affinity_host
         .or(original_host)
         .zip(original_port)
-        .map(|(host, port)| PatchedChatServer { host, port })?;
+        .map(|(host, port)| PatchedChatServer {
+            host,
+            port,
+            affinity: affinity.map(ToOwned::to_owned),
+        })?;
 
     if json.get("chat.host").is_some() {
         json["chat.host"] = Value::String(LOCALHOST_DOMAIN.to_string());
@@ -509,6 +541,15 @@ fn log_error(tx: &Sender<LogEntry>, message: String) {
         timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
         level: LogLevel::Error,
         category: LogCategory::Error,
+        message,
+    });
+}
+
+fn log_warn(tx: &Sender<LogEntry>, message: String) {
+    let _ = tx.send(LogEntry {
+        timestamp: chrono::Utc::now().format("%H:%M:%S").to_string(),
+        level: LogLevel::Warn,
+        category: LogCategory::Config,
         message,
     });
 }
@@ -879,6 +920,7 @@ mod tests {
             PatchedChatServer {
                 host: "na2.chat.si.riotgames.com".to_string(),
                 port: 5223,
+                affinity: None,
             },
         );
 
@@ -896,6 +938,7 @@ mod tests {
             PatchedChatServer {
                 host: "na2.chat.si.riotgames.com".to_string(),
                 port: 5223,
+                affinity: None,
             },
         );
 
@@ -1003,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_config_prefers_selected_affinity_host() {
+    fn rewrite_config_prefers_configured_affinity_host() {
         let mut config = json!({
             "chat.host": "fallback.chat.si.riotgames.com",
             "chat.port": 5223,
@@ -1024,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_config_uses_chat_host_when_affinity_is_unknown() {
+    fn rewrite_config_uses_chat_host_when_affinity_is_not_in_config() {
         let mut config = json!({
             "chat.host": "fallback.chat.si.riotgames.com",
             "chat.port": 5223,
@@ -1042,6 +1085,45 @@ mod tests {
         assert_eq!(config["chat.host"], LOCALHOST_DOMAIN);
         assert_eq!(config["chat.affinities"]["na"], LOCALHOST_DOMAIN);
         assert_eq!(config["chat.affinities"]["pbe"], LOCALHOST_DOMAIN);
+    }
+
+    #[test]
+    fn rewrite_config_uses_config_host_even_when_affinity_name_differs() {
+        let mut config = json!({
+            "chat.host": "na2.chat.si.riotgames.com",
+            "chat.port": 5223,
+            "chat.affinities": {
+                "na1": "na2.chat.si.riotgames.com"
+            }
+        });
+
+        let server = rewrite_config_with_affinity(&mut config, 49232, Some("na1"))
+            .expect("server should be detected");
+
+        assert_eq!(server.host, "na2.chat.si.riotgames.com");
+        assert_eq!(server.affinity.as_deref(), Some("na1"));
+        assert_eq!(server.port, 5223);
+        assert_eq!(config["chat.host"], LOCALHOST_DOMAIN);
+        assert_eq!(config["chat.affinities"]["na1"], LOCALHOST_DOMAIN);
+    }
+
+    #[test]
+    fn rewrite_config_falls_back_to_chat_host_for_invalid_affinity_name() {
+        let mut config = json!({
+            "chat.host": "fallback.chat.si.riotgames.com",
+            "chat.port": 5223,
+            "chat.affinities": {
+                "na": "na2.chat.si.riotgames.com"
+            }
+        });
+
+        let server = rewrite_config_with_affinity(&mut config, 49232, Some("bad.host"))
+            .expect("server should be detected");
+
+        assert_eq!(server.host, "fallback.chat.si.riotgames.com");
+        assert_eq!(server.port, 5223);
+        assert_eq!(config["chat.host"], LOCALHOST_DOMAIN);
+        assert_eq!(config["chat.affinities"]["na"], LOCALHOST_DOMAIN);
     }
 
     #[test]
