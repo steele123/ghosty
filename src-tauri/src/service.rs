@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -26,6 +26,8 @@ use crate::{
 const STREAM_EVENT_PREVIEW_CHARS: usize = 1_400;
 const LOG_BUFFER_LIMIT: usize = 240;
 const STREAM_EVENT_BUFFER_LIMIT: usize = 800;
+const STARTUP_PRESENCE_REPLAY_IDLE_MS: u64 = 350;
+const STARTUP_PRESENCE_REPLAY_MIN_AGE_MS: u64 = 1_200;
 
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -618,18 +620,17 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
     let mut logged_client_presence = false;
     let mut logged_server_presence = false;
     let mut inserted_helper_friend = false;
+    let mut sent_helper_roster = false;
     let mut sent_helper_presence = false;
     let mut refreshed_helper_presence_after_client_presence = false;
     let mut sent_helper_intro = false;
     let mut logged_roster_without_helper = false;
     let mut startup_roster_ready = false;
-    let mut delayed_startup_presence = Vec::<u8>::new();
-    let mut logged_delayed_startup_presence = false;
+    let mut startup_presence_replay = StartupPresenceReplay::new();
     let helper_jid = presence::helper_jid_for_chat_identity(
         &context.server.host,
         context.server.affinity.as_deref(),
     );
-    let mut helper_injector = HelperFriendInjector::new(helper_jid.clone());
     let mut helper_command_buffer = HelperCommandBuffer::new(helper_jid.clone());
     let mut presence_buffer = ClientPresenceBuffer::new();
     let mut server_presence_stats = PresenceStats::default();
@@ -672,9 +673,6 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
         let mut made_progress = false;
         let helper_friend_enabled = context.helper_friend.load(Ordering::Relaxed);
 
-        if !helper_friend_enabled && was_helper_friend_enabled && !helper_injector.is_empty() {
-            incoming.write_all(&helper_injector.flush())?;
-        }
         if !helper_friend_enabled && was_helper_friend_enabled {
             helper_command_buffer.clear();
         }
@@ -883,62 +881,32 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                         }
                         if helper_friend_enabled
                             && !startup_roster_ready
-                            && !presence::contains_roster_marker(&content)
-                            && content.contains("<presence")
-                            && !helper_injector.is_empty()
+                            && presence::contains_roster_marker(&content)
                         {
-                            delayed_startup_presence.extend_from_slice(&bytes_to_client);
-                            if !logged_delayed_startup_presence {
-                                logged_delayed_startup_presence = true;
-                                log(
-                                    &context.log_tx,
-                                    LogCategory::Chat,
-                                    LogLevel::Info,
-                                    "Delayed startup presence until initial roster finished",
-                                );
-                            }
-                            bytes_to_client.clear();
-                            continue;
-                        }
-                        if helper_friend_enabled && !inserted_helper_friend {
-                            let injection = helper_injector.push(&content);
-                            if injection.inserted {
-                                inserted_helper_friend = true;
-                                startup_roster_ready = true;
-                                if !roster_domains_logged {
-                                    roster_domains_logged = true;
-                                    roster_jid_domains = injection.roster_jid_domains.clone();
-                                    if let Some(summary) =
-                                        jid_domain_summary(&content, "jid", "Roster JID domains")
-                                    {
-                                        log(
-                                            &context.log_tx,
-                                            LogCategory::Chat,
-                                            LogLevel::Info,
-                                            summary,
-                                        );
-                                    }
-                                }
-                                if let (Some(before), Some(after)) =
-                                    (injection.roster_items_before, injection.roster_items_after)
+                            startup_roster_ready = true;
+                            let roster_items = presence::roster_item_count(&content);
+                            roster_jid_domains = jid_domain_map(&content, "jid");
+                            if !roster_domains_logged {
+                                roster_domains_logged = true;
+                                if let Some(summary) =
+                                    jid_domain_summary(&content, "jid", "Roster JID domains")
                                 {
                                     log(
                                         &context.log_tx,
                                         LogCategory::Chat,
                                         LogLevel::Info,
-                                        format!(
-                                            "Inserted Ghosty helper into initial roster: received {before} Riot friends and forwarded {after} roster items"
-                                        ),
+                                        summary,
                                     );
                                 }
-                                log(
-                                    &context.log_tx,
-                                    LogCategory::Chat,
-                                    LogLevel::Info,
-                                    "Inserted Ghosty helper friend into roster",
-                                );
                             }
-                            bytes_to_client = injection.bytes;
+                            log(
+                                &context.log_tx,
+                                LogCategory::Chat,
+                                LogLevel::Info,
+                                format!(
+                                    "Forwarded initial Riot roster unchanged ({roster_items} items in current chunk); Ghosty helper will be added after startup"
+                                ),
+                            );
                         } else if !helper_friend_enabled
                             && !logged_roster_without_helper
                             && presence::contains_roster_marker(&content)
@@ -961,11 +929,6 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     }
                     Utf8Chunk::Binary(bytes) => {
                         bytes_to_client = bytes;
-                        if !helper_injector.is_empty() {
-                            let mut pending = helper_injector.flush();
-                            pending.extend_from_slice(&bytes_to_client);
-                            bytes_to_client = pending;
-                        }
                     }
                     Utf8Chunk::Pending => {}
                 }
@@ -994,17 +957,41 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                             }
                         }
                     }
+                    if startup_roster_ready {
+                        if let Ok(content) = std::str::from_utf8(&bytes_to_client) {
+                            let added = startup_presence_replay.push(content);
+                            if added > 0 && startup_presence_replay.stanza_count() == added {
+                                log(
+                                    &context.log_tx,
+                                    LogCategory::Chat,
+                                    LogLevel::Info,
+                                    "Capturing initial server presence for startup replay",
+                                );
+                            }
+                        }
+                    }
                     log_stream_bytes(&context.stream_tx, "ghosty -> client", &bytes_to_client);
                     incoming.write_all(&bytes_to_client)?;
                 }
-                if startup_roster_ready && !delayed_startup_presence.is_empty() {
-                    let delayed = std::mem::take(&mut delayed_startup_presence);
+                if helper_friend_enabled
+                    && startup_presence_replay.replayed()
+                    && !sent_helper_roster
+                {
+                    sent_helper_roster = true;
+                    inserted_helper_friend = true;
+                    let roster_push = presence::helper_roster_push(&helper_jid);
                     log_stream_bytes(
                         &context.stream_tx,
-                        "ghosty -> client delayed startup presence",
-                        &delayed,
+                        "ghosty -> client helper roster",
+                        roster_push.as_bytes(),
                     );
-                    incoming.write_all(&delayed)?;
+                    incoming.write_all(roster_push.as_bytes())?;
+                    log(
+                        &context.log_tx,
+                        LogCategory::Chat,
+                        LogLevel::Info,
+                        "Added Ghosty helper friend after startup roster and presence",
+                    );
                 }
                 if helper_friend_enabled && inserted_helper_friend && !sent_helper_presence {
                     sent_helper_presence = true;
@@ -1072,12 +1059,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                 });
             }
             StreamRead::Closed => {
-                let mut pending = outgoing_text_buffer.flush();
-                if !helper_injector.is_empty() {
-                    let mut helper_pending = helper_injector.flush();
-                    helper_pending.extend_from_slice(&pending);
-                    pending = helper_pending;
-                }
+                let pending = outgoing_text_buffer.flush();
                 if !pending.is_empty() {
                     log_stream_bytes(&context.stream_tx, "ghosty -> client", &pending);
                     incoming.write_all(&pending)?;
@@ -1085,6 +1067,28 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                 return Err(CleanConnectionClose.into());
             }
             StreamRead::WouldBlock => {}
+        }
+
+        if !made_progress && startup_presence_replay.is_ready() {
+            let replay = startup_presence_replay.take();
+            if !replay.is_empty() {
+                log_stream_bytes(
+                    &context.stream_tx,
+                    "ghosty -> client startup presence replay",
+                    &replay,
+                );
+                incoming.write_all(&replay)?;
+                log(
+                    &context.log_tx,
+                    LogCategory::Chat,
+                    LogLevel::Info,
+                    format!(
+                        "Replayed {} startup presence stanzas after initial roster",
+                        startup_presence_replay.replayed_count()
+                    ),
+                );
+                made_progress = true;
+            }
         }
 
         if !made_progress {
@@ -1250,19 +1254,21 @@ fn forward_client_chat(
     Ok(())
 }
 
+#[cfg(test)]
 struct HelperFriendInjector {
     pending: String,
     helper_jid: String,
 }
 
+#[cfg(test)]
 struct HelperInjection {
     bytes: Vec<u8>,
     inserted: bool,
     roster_items_before: Option<usize>,
     roster_items_after: Option<usize>,
-    roster_jid_domains: std::collections::BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 impl HelperFriendInjector {
     fn new(helper_jid: String) -> Self {
         Self {
@@ -1277,14 +1283,12 @@ impl HelperFriendInjector {
         if let Some(updated) = presence::insert_helper_friend(&self.pending, &self.helper_jid) {
             let roster_items_before = presence::roster_item_count(&self.pending);
             let roster_items_after = presence::roster_item_count(&updated);
-            let roster_jid_domains = jid_domain_map(&self.pending, "jid");
             self.pending.clear();
             return HelperInjection {
                 bytes: updated.into_bytes(),
                 inserted: true,
                 roster_items_before: Some(roster_items_before),
                 roster_items_after: Some(roster_items_after),
-                roster_jid_domains,
             };
         }
 
@@ -1295,7 +1299,6 @@ impl HelperFriendInjector {
                 inserted: false,
                 roster_items_before: None,
                 roster_items_after: None,
-                roster_jid_domains: std::collections::BTreeMap::new(),
             };
         }
 
@@ -1307,7 +1310,6 @@ impl HelperFriendInjector {
             inserted: false,
             roster_items_before: None,
             roster_items_after: None,
-            roster_jid_domains: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1495,6 +1497,124 @@ impl PresenceBatchStats {
             league_mobile: count_league_st(content, "mobile"),
         }
     }
+}
+
+struct StartupPresenceReplay {
+    pending: String,
+    replay: Vec<u8>,
+    stanzas: usize,
+    replayed_stanzas: usize,
+    first_seen: Option<Instant>,
+    last_seen: Option<Instant>,
+    replayed: bool,
+}
+
+impl StartupPresenceReplay {
+    const MAX_REPLAY_BYTES: usize = 768 * 1024;
+
+    fn new() -> Self {
+        Self {
+            pending: String::new(),
+            replay: Vec::new(),
+            stanzas: 0,
+            replayed_stanzas: 0,
+            first_seen: None,
+            last_seen: None,
+            replayed: false,
+        }
+    }
+
+    fn push(&mut self, content: &str) -> usize {
+        if self.replayed {
+            return 0;
+        }
+
+        self.pending.push_str(content);
+        let mut added = 0;
+
+        loop {
+            let Some(start) = self.pending.find("<presence") else {
+                self.trim_non_presence_prefix();
+                break;
+            };
+            if start > 0 {
+                self.pending.drain(..start);
+            }
+
+            let Some(end) = presence_stanza_end(&self.pending) else {
+                break;
+            };
+            let stanza = self.pending[..end].to_string();
+            self.pending.drain(..end);
+
+            if self.replay.len() + stanza.len() > Self::MAX_REPLAY_BYTES {
+                self.replayed = true;
+                break;
+            }
+
+            let now = Instant::now();
+            self.first_seen.get_or_insert(now);
+            self.last_seen = Some(now);
+            self.replay.extend_from_slice(stanza.as_bytes());
+            self.stanzas += 1;
+            added += 1;
+        }
+
+        added
+    }
+
+    fn stanza_count(&self) -> usize {
+        self.stanzas
+    }
+
+    fn replayed_count(&self) -> usize {
+        self.replayed_stanzas
+    }
+
+    fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    fn is_ready(&self) -> bool {
+        if self.replayed || self.replay.is_empty() {
+            return false;
+        }
+        let (Some(first_seen), Some(last_seen)) = (self.first_seen, self.last_seen) else {
+            return false;
+        };
+
+        first_seen.elapsed() >= Duration::from_millis(STARTUP_PRESENCE_REPLAY_MIN_AGE_MS)
+            && last_seen.elapsed() >= Duration::from_millis(STARTUP_PRESENCE_REPLAY_IDLE_MS)
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        self.replayed = true;
+        self.replayed_stanzas = self.stanzas;
+        self.pending.clear();
+        std::mem::take(&mut self.replay)
+    }
+
+    fn trim_non_presence_prefix(&mut self) {
+        let keep = partial_marker_tail_len(&self.pending, "<presence");
+        if keep == 0 {
+            self.pending.clear();
+        } else if self.pending.len() > keep {
+            let tail = self.pending[self.pending.len() - keep..].to_string();
+            self.pending = tail;
+        }
+    }
+}
+
+fn presence_stanza_end(content: &str) -> Option<usize> {
+    let open_end = content.find('>')? + 1;
+    let opening = &content[..open_end];
+    if opening.trim_end().ends_with("/>") {
+        return Some(open_end);
+    }
+
+    content
+        .find("</presence>")
+        .map(|end| end + "</presence>".len())
 }
 
 enum HelperCommandResult {
@@ -1900,6 +2020,7 @@ fn jid_domain(jid: &str) -> Option<&str> {
     (!domain.is_empty()).then_some(domain)
 }
 
+#[cfg(test)]
 fn possible_roster_prefix_len(content: &str) -> usize {
     if let Some(query_at) = content.rfind("<query") {
         let tail = &content[query_at..];
@@ -3683,6 +3804,41 @@ mod tests {
         );
 
         assert!(stats.is_warmup_ready());
+    }
+
+    #[test]
+    fn startup_presence_replay_extracts_only_presence_stanzas() {
+        let mut replay = StartupPresenceReplay::new();
+
+        let added = replay.push(
+            "<iq id='1'/><presence from='a@na1.pvp.net'><show>chat</show></presence><message/>\
+             <presence from='b@na1.pvp.net' type='unavailable'/>",
+        );
+        let body = String::from_utf8(replay.take()).expect("replay should be utf8");
+
+        assert_eq!(added, 2);
+        assert_eq!(replay.replayed_count(), 2);
+        assert!(body.contains("from='a@na1.pvp.net'"));
+        assert!(body.contains("from='b@na1.pvp.net'"));
+        assert!(!body.contains("<iq"));
+        assert!(!body.contains("<message"));
+    }
+
+    #[test]
+    fn startup_presence_replay_waits_for_split_stanza() {
+        let mut replay = StartupPresenceReplay::new();
+
+        assert_eq!(
+            replay.push("<presence from='a@na1.pvp.net'><show>chat</show>"),
+            0
+        );
+        assert_eq!(replay.push("</presence><iq/>"), 1);
+        let body = String::from_utf8(replay.take()).expect("replay should be utf8");
+
+        assert_eq!(
+            body,
+            "<presence from='a@na1.pvp.net'><show>chat</show></presence>"
+        );
     }
 
     #[test]

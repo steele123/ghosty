@@ -129,6 +129,7 @@ pub fn helper_jid_for_chat_identity(host: &str, affinity: Option<&str>) -> Strin
     format!("{HELPER_PUUID}@{affinity}.pvp.net")
 }
 
+#[cfg(test)]
 pub fn insert_helper_friend(content: &str, helper_jid: &str) -> Option<String> {
     if content.contains(helper_jid) {
         return None;
@@ -138,6 +139,14 @@ pub fn insert_helper_friend(content: &str, helper_jid: &str) -> Option<String> {
     let mut updated = content.to_string();
     updated.insert_str(open_at, &helper_roster_item(helper_jid));
     Some(updated)
+}
+
+pub fn helper_roster_push(helper_jid: &str) -> String {
+    let now = chrono::Utc::now().timestamp_millis();
+    format!(
+        "<iq type='set' id='ghosty-roster-{now}'><query xmlns='{ROSTER_NAMESPACE}'>{}</query></iq>",
+        helper_roster_item(helper_jid)
+    )
 }
 
 pub fn contains_roster_marker(content: &str) -> bool {
@@ -174,6 +183,7 @@ pub fn roster_item_count(content: &str) -> usize {
     content.match_indices("<item").count()
 }
 
+#[cfg(test)]
 fn roster_query_insert_at(content: &str) -> Option<usize> {
     let mut search_from = 0;
     while let Some(relative_query_at) = content[search_from..].find("<query") {
@@ -459,6 +469,16 @@ mod tests {
         assert!(
             item.contains("<platforms><riot name='&#9;Ghosty Active' tagline='...'/></platforms>")
         );
+    }
+
+    #[test]
+    fn helper_roster_push_wraps_helper_item_without_replacing_initial_roster() {
+        let push = helper_roster_push(TEST_HELPER_JID);
+
+        assert!(push.contains("type='set'"));
+        assert!(push.contains("jabber:iq:riotgames:roster"));
+        assert!(push.contains(TEST_HELPER_JID));
+        assert!(push.contains("Ghosty Active!"));
     }
 
     #[test]
