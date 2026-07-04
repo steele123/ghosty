@@ -36,6 +36,11 @@ fn kill_riot_processes(state: State<'_, SharedState>) -> Result<AppSnapshot, Str
 }
 
 #[tauri::command]
+fn running_riot_processes() -> Result<Vec<String>, String> {
+    riot::running_riot_processes().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn run_preflight(state: State<'_, SharedState>) -> Result<PreflightReport, String> {
     Ok(state.lock().map_err(|e| e.to_string())?.preflight())
 }
@@ -165,6 +170,7 @@ pub fn run() {
             get_snapshot,
             locate_riot_client,
             kill_riot_processes,
+            running_riot_processes,
             run_preflight,
             start_deceive,
             clean_restart,

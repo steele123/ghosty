@@ -77,6 +77,43 @@ pub fn rewrite_presence_fragment(
     }
 }
 
+pub fn rewrite_unaddressed_presence_only_fragment(
+    content: &str,
+    target_status: PresenceStatus,
+    valorant_version: &mut Option<String>,
+) -> Result<Option<Vec<u8>>> {
+    if !content.contains("<presence") {
+        return Ok(None);
+    }
+
+    let wrapped = format!("<xml>{content}</xml>");
+    let Ok(mut root) = Element::parse_with_config(
+        Cursor::new(wrapped.as_bytes()),
+        ParserConfig::new().whitespace_to_characters(true),
+    ) else {
+        return Ok(None);
+    };
+
+    let mut rewritten = Vec::new();
+    for node in root.children.iter_mut() {
+        let XMLNode::Element(element) = node else {
+            continue;
+        };
+        if element.name != "presence" || element.attributes.contains_key("to") {
+            continue;
+        }
+
+        rewrite_presence(element, target_status, valorant_version);
+        rewritten.push(serialize_element(element)?);
+    }
+
+    if rewritten.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(rewritten.join("").into_bytes()))
+}
+
 pub fn helper_jid_for_chat_identity(host: &str, affinity: Option<&str>) -> String {
     let affinity = affinity
         .map(str::trim)
@@ -105,6 +142,36 @@ pub fn insert_helper_friend(content: &str, helper_jid: &str) -> Option<String> {
 
 pub fn contains_roster_marker(content: &str) -> bool {
     content.contains(ROSTER_NAMESPACE)
+}
+
+pub fn contains_unaddressed_presence_fragment(content: &str) -> bool {
+    if !content.contains("<presence") {
+        return false;
+    }
+
+    let wrapped = format!("<xml>{content}</xml>");
+    let Ok(root) = Element::parse_with_config(
+        Cursor::new(wrapped.as_bytes()),
+        ParserConfig::new().whitespace_to_characters(true),
+    ) else {
+        return false;
+    };
+
+    root.children.iter().any(|node| {
+        matches!(
+            node,
+            XMLNode::Element(element)
+                if element.name == "presence" && !element.attributes.contains_key("to")
+        )
+    })
+}
+
+pub fn roster_item_count(content: &str) -> usize {
+    if !contains_roster_marker(content) {
+        return 0;
+    }
+
+    content.match_indices("<item").count()
 }
 
 fn roster_query_insert_at(content: &str) -> Option<usize> {
@@ -235,13 +302,9 @@ fn rewrite_presence(
 
     remove_child(presence, "status");
 
-    if target_status == PresenceStatus::Mobile {
-        if let Some(league) = child_path_mut(presence, &["games", "league_of_legends"]) {
-            remove_child(league, "p");
-            remove_child(league, "m");
-        }
-    } else if let Some(games) = child_path_mut(presence, &["games"]) {
-        remove_child(games, "league_of_legends");
+    if let Some(league) = child_path_mut(presence, &["games", "league_of_legends"]) {
+        remove_child(league, "p");
+        remove_child(league, "m");
     }
 
     if valorant_version.is_none() {
@@ -372,6 +435,20 @@ mod tests {
     }
 
     #[test]
+    fn counts_roster_items_only_inside_roster_payloads() {
+        assert_eq!(
+            roster_item_count(
+                "<iq><query xmlns='jabber:iq:riotgames:roster'><item jid='a'/><item jid='b'/></query></iq>"
+            ),
+            2
+        );
+        assert_eq!(
+            roster_item_count("<message><item jid='not-roster'/></message>"),
+            0
+        );
+    }
+
+    #[test]
     fn helper_roster_item_uses_client_visible_identity_fields() {
         let item = helper_roster_item(TEST_HELPER_JID);
 
@@ -420,6 +497,38 @@ mod tests {
         );
 
         assert!(insert_helper_friend(&input, TEST_HELPER_JID).is_none());
+    }
+
+    #[test]
+    fn detects_unaddressed_presence_in_mixed_fragments() {
+        assert!(contains_unaddressed_presence_fragment(
+            "<message/><presence><show>chat</show></presence>"
+        ));
+        assert!(!contains_unaddressed_presence_fragment(
+            "<presence to='room@conference.pvp.net'><show>chat</show></presence>"
+        ));
+        assert!(!contains_unaddressed_presence_fragment(
+            "<presence><show>chat"
+        ));
+    }
+
+    #[test]
+    fn rewrites_only_unaddressed_presence_for_warmup_followup() {
+        let mut valorant_version = None;
+        let rewritten = rewrite_unaddressed_presence_only_fragment(
+            "<iq type='get' id='1'/><presence id='presence_5'><show>chat</show><status>hello</status><games><keystone><st>chat</st></keystone></games></presence><presence to='room@conference.pvp.net'><show>chat</show></presence>",
+            PresenceStatus::Mobile,
+            &mut valorant_version,
+        )
+        .expect("rewrite should not fail")
+        .expect("presence should be rewritten");
+        let rewritten = String::from_utf8(rewritten).expect("presence should stay utf8");
+
+        assert!(rewritten.contains("<presence id=\"presence_5\">"));
+        assert!(rewritten.contains("<show>mobile</show>"));
+        assert!(!rewritten.contains("<iq"));
+        assert!(!rewritten.contains("conference.pvp.net"));
+        assert!(!rewritten.contains("<status>hello</status>"));
     }
 
     #[test]
@@ -570,7 +679,33 @@ mod tests {
         };
 
         assert!(rewritten.contains("<show>offline</show>"));
-        assert!(!rewritten.contains("league_of_legends"));
+        assert!(rewritten.contains("<league_of_legends>"));
+        assert!(rewritten.contains("<st>offline</st>"));
+        assert!(!rewritten.contains("<status>"));
+    }
+
+    #[test]
+    fn offline_presence_preserves_league_product_node_without_rich_payload() {
+        let mut valorant_version = None;
+        let rewritten = rewrite_presence_fragment(
+            "<presence><games><league_of_legends><st>chat</st><s.p>league_of_legends</s.p><s.c>live</s.c><p>{}</p><m>secret</m></league_of_legends></games><show>chat</show><status>hello</status></presence>",
+            true,
+            PresenceStatus::Offline,
+            false,
+            &mut valorant_version,
+        )
+        .expect("rewrite should succeed")
+        .expect("presence should be rewritten");
+        let PresenceRewrite::Forward(rewritten) = rewritten else {
+            panic!("presence should be forwarded after rewrite");
+        };
+
+        assert!(rewritten.contains("<league_of_legends>"));
+        assert!(rewritten.contains("<st>offline</st>"));
+        assert!(rewritten.contains("<s.p>league_of_legends</s.p>"));
+        assert!(rewritten.contains("<s.c>live</s.c>"));
+        assert!(!rewritten.contains("<p>"));
+        assert!(!rewritten.contains("<m>"));
         assert!(!rewritten.contains("<status>"));
     }
 }

@@ -137,6 +137,11 @@
   let activeTab = $state<AppTab>("launch");
   let logFilter = $state<"all" | LogCategory>("all");
   let preflightReport = $state<PreflightReport | null>(null);
+  let riotRestartDialogOpen = $state(false);
+  let pendingRiotProcesses = $state<string[]>([]);
+  let streamAutoScroll = $state(true);
+  let streamLogElement = $state<HTMLDivElement | null>(null);
+  let lastStreamEventCount = 0;
   let snapshotRequestId = 0;
   let launchFormInitialized = false;
   let busy = $derived(pendingActions > 0);
@@ -190,6 +195,7 @@
       if (requestId === snapshotRequestId) {
         snapshot = nextSnapshot;
         syncLaunchFormFromSnapshot(nextSnapshot);
+        scrollStreamIfNeeded();
         refreshError = "";
       }
     } catch (err) {
@@ -205,6 +211,7 @@
     if (requestId === snapshotRequestId) {
       snapshot = nextSnapshot;
       syncLaunchFormFromSnapshot(nextSnapshot);
+      scrollStreamIfNeeded();
     }
   }
 
@@ -214,6 +221,16 @@
       return;
     }
     persistLaunchForm();
+    const runningRiotProcesses = await call(() => invoke<string[]>("running_riot_processes"));
+    if (runningRiotProcesses.length) {
+      pendingRiotProcesses = runningRiotProcesses;
+      riotRestartDialogOpen = true;
+      return;
+    }
+    await startProxy();
+  }
+
+  async function startProxy() {
     await updateSnapshot(() =>
       invoke<AppSnapshot>("start_deceive", {
         game: selectedGame,
@@ -223,6 +240,25 @@
         launchGame
       })
     );
+  }
+
+  async function confirmRiotRestart() {
+    riotRestartDialogOpen = false;
+    pendingRiotProcesses = [];
+    await updateSnapshot(() => invoke<AppSnapshot>("kill_riot_processes"));
+    await startProxy();
+  }
+
+  function cancelRiotRestart() {
+    riotRestartDialogOpen = false;
+    pendingRiotProcesses = [];
+    notice = "Start cancelled. Stop Riot Client first or allow Ghosty to restart it.";
+  }
+
+  function handleWindowKeydown(event: KeyboardEvent) {
+    if (riotRestartDialogOpen && event.key === "Escape" && !busy) {
+      cancelRiotRestart();
+    }
   }
 
   async function stop() {
@@ -375,6 +411,32 @@
     return snapshot.streamEvents.slice().reverse();
   }
 
+  function toggleStreamAutoScroll() {
+    streamAutoScroll = !streamAutoScroll;
+    if (streamAutoScroll) {
+      scrollStreamToLatest();
+    }
+  }
+
+  function scrollStreamIfNeeded() {
+    const nextCount = snapshot.streamEvents.length;
+    const hasNewEvents = nextCount !== lastStreamEventCount;
+    lastStreamEventCount = nextCount;
+    if (streamAutoScroll && hasNewEvents) {
+      window.requestAnimationFrame(scrollStreamToLatest);
+    }
+  }
+
+  function scrollStreamToLatest() {
+    if (streamLogElement) {
+      streamLogElement.scrollTop = 0;
+    }
+  }
+
+  function presenceLabel(status: PresenceStatus) {
+    return statuses.find((item) => item.id === status)?.label ?? status;
+  }
+
   function selectGame(game: LaunchGame) {
     selectedGame = game;
     persistLaunchForm();
@@ -468,12 +530,24 @@
   <title>Ghosty</title>
 </svelte:head>
 
+<svelte:window onkeydown={handleWindowKeydown} />
+
 <div class="titlebar">
   <div class="drag-region" data-tauri-drag-region role="presentation" ondblclick={toggleMaximizeWindow}>
     <img class="brand-mark" data-tauri-drag-region src="/icon.png" alt="" />
     <div class="title-copy" data-tauri-drag-region>
       <strong data-tauri-drag-region>Ghosty</strong>
       <span data-tauri-drag-region>{snapshot.running ? "Masking console active" : "Masking console idle"}</span>
+    </div>
+    <div class="title-status" data-tauri-drag-region>
+      <span class:online={snapshot.running} class="title-status-chip" data-tauri-drag-region>
+        <Activity size={12} />
+        {snapshot.running ? "Proxy Running" : "Proxy Stopped"}
+      </span>
+      <span class="title-status-chip presence" data-status={snapshot.status} data-tauri-drag-region>
+        <Shield size={12} />
+        League {presenceLabel(snapshot.status)}
+      </span>
     </div>
   </div>
   <div class="window-controls">
@@ -509,6 +583,38 @@
 
   {#if notice}
     <section class="notice">{notice}</section>
+  {/if}
+
+  {#if riotRestartDialogOpen}
+    <div class="dialog-overlay">
+      <div class="dialog-content" role="dialog" aria-modal="true" aria-labelledby="riot-restart-title" aria-describedby="riot-restart-description">
+        <div class="dialog-header">
+          <div class="dialog-icon">
+            <Trash2 size={20} />
+          </div>
+          <div>
+            <h2 id="riot-restart-title">Restart Riot Client?</h2>
+            <p id="riot-restart-description">
+              Ghosty needs to launch Riot Client itself so chat routes through the local proxy.
+            </p>
+          </div>
+        </div>
+        <div class="dialog-body">
+          <p>These Riot/League processes are already running:</p>
+          <div class="process-list">
+            {#each pendingRiotProcesses as process}
+              <span>{process}</span>
+            {/each}
+          </div>
+        </div>
+        <div class="dialog-footer">
+          <button disabled={busy} type="button" onclick={cancelRiotRestart}>Cancel</button>
+          <button class="danger" disabled={busy} type="button" onclick={() => runAction(confirmRiotRestart)}>
+            <Trash2 size={16} /> Stop Riot and Start
+          </button>
+        </div>
+      </div>
+    </div>
   {/if}
 
   <nav class="tabs" aria-label="Ghosty sections">
@@ -751,11 +857,15 @@
       <div class="panel-title">
         <Activity size={18} />
         <h2>Event Stream</h2>
+        <label class="auto-scroll-toggle" title="Keep event stream pinned to newest entries">
+          <input type="checkbox" checked={streamAutoScroll} onchange={toggleStreamAutoScroll} />
+          <span>Auto Scroll</span>
+        </label>
         <button class="icon-action" disabled={busy} type="button" title="Copy event stream" onclick={() => runAction(copyStreamEvents)}>
           <Clipboard size={16} />
         </button>
       </div>
-      <div class="log stream-log">
+      <div class="log stream-log" bind:this={streamLogElement}>
         {#if streamEvents().length}
           {#each streamEvents() as event}
             <p>
@@ -871,6 +981,44 @@
     white-space: nowrap;
   }
 
+  .title-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    margin-left: auto;
+  }
+
+  .title-status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    min-height: 24px;
+    padding: 0 8px;
+    border: 1px solid #d2dae3;
+    border-radius: 7px;
+    background: #f7fafc;
+    color: #7a2e38;
+    font-size: 12px;
+    font-weight: 800;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .title-status-chip.online,
+  .title-status-chip[data-status="chat"] {
+    border-color: #9fd0b7;
+    background: #effaf4;
+    color: #14633f;
+  }
+
+  .title-status-chip[data-status="mobile"] {
+    border-color: #9fbfe0;
+    background: #eef6ff;
+    color: #255f99;
+  }
+
   .window-controls {
     display: flex;
     align-items: stretch;
@@ -966,6 +1114,113 @@
     color: #14633f;
   }
 
+  .dialog-overlay {
+    position: fixed;
+    z-index: 40;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    padding: 18px;
+    background: rgba(14, 23, 33, 0.46);
+  }
+
+  .dialog-content {
+    width: min(460px, 100%);
+    display: grid;
+    gap: 18px;
+    border: 1px solid #d6dde5;
+    border-radius: 8px;
+    background: #fff;
+    padding: 20px;
+    box-shadow: 0 22px 70px rgba(12, 24, 36, 0.24);
+  }
+
+  .dialog-header {
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+  }
+
+  .dialog-icon {
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    border: 1px solid #f0c2c7;
+    border-radius: 8px;
+    background: #fff2f3;
+    color: #a52835;
+  }
+
+  .dialog-header h2 {
+    color: #172232;
+    font-size: 18px;
+    line-height: 1.25;
+  }
+
+  .dialog-header p,
+  .dialog-body p {
+    color: #5c6875;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .dialog-body {
+    display: grid;
+    gap: 10px;
+  }
+
+  .process-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+  }
+
+  .process-list span {
+    padding: 5px 8px;
+    border: 1px solid #d6dde5;
+    border-radius: 7px;
+    background: #f4f7fa;
+    color: #344252;
+    font-size: 12px;
+    font-weight: 800;
+  }
+
+  .dialog-footer {
+    display: flex;
+    justify-content: end;
+    gap: 8px;
+  }
+
+  .dialog-footer button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 34px;
+    padding: 0 12px;
+    border: 1px solid #c9d1da;
+    border-radius: 7px;
+    background: #fff;
+    color: #263342;
+    font-weight: 800;
+  }
+
+  .dialog-footer button:hover:not(:disabled) {
+    background: #f4f7fa;
+  }
+
+  .dialog-footer button.danger {
+    border-color: #a52835;
+    background: #a52835;
+    color: #fff;
+  }
+
+  .dialog-footer button.danger:hover:not(:disabled) {
+    background: #8e202c;
+  }
+
   .tabs {
     display: inline-grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1037,6 +1292,32 @@
 
   .panel-title .icon-action {
     margin-left: auto;
+  }
+
+  .auto-scroll-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 28px;
+    margin-left: auto;
+    padding: 0 8px;
+    border: 1px solid #d6dde5;
+    border-radius: 7px;
+    background: #f7fafc;
+    color: #405060;
+    font-size: 12px;
+    font-weight: 800;
+    white-space: nowrap;
+  }
+
+  .auto-scroll-toggle input {
+    width: 14px;
+    height: 14px;
+    accent-color: #2364aa;
+  }
+
+  .auto-scroll-toggle + .icon-action {
+    margin-left: 0;
   }
 
   h2 {
@@ -1424,6 +1705,10 @@
   }
 
   @media (max-width: 860px) {
+    .title-copy span {
+      display: none;
+    }
+
     header {
       align-items: start;
       flex-direction: column;
@@ -1447,7 +1732,25 @@
     }
   }
 
+  @media (max-width: 620px) {
+    .title-status-chip {
+      max-width: 118px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+  }
+
   @media (max-width: 520px) {
+    .title-status {
+      display: none;
+    }
+
+    .dialog-footer {
+      display: grid;
+      grid-template-columns: 1fr;
+    }
+
     .shell {
       width: min(100vw - 20px, 1120px);
       padding: 14px 0;

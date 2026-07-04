@@ -622,6 +622,9 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
     let mut refreshed_helper_presence_after_client_presence = false;
     let mut sent_helper_intro = false;
     let mut logged_roster_without_helper = false;
+    let mut startup_roster_ready = false;
+    let mut delayed_startup_presence = Vec::<u8>::new();
+    let mut logged_delayed_startup_presence = false;
     let helper_jid = presence::helper_jid_for_chat_identity(
         &context.server.host,
         context.server.affinity.as_deref(),
@@ -629,6 +632,10 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
     let mut helper_injector = HelperFriendInjector::new(helper_jid.clone());
     let mut helper_command_buffer = HelperCommandBuffer::new(helper_jid.clone());
     let mut presence_buffer = ClientPresenceBuffer::new();
+    let mut server_presence_stats = PresenceStats::default();
+    let mut roster_jid_domains = std::collections::BTreeMap::<String, String>::new();
+    let mut roster_domains_logged = false;
+    let mut logged_presence_domain_normalization = false;
     let mut incoming_text_buffer = Utf8StreamBuffer::new();
     let mut outgoing_text_buffer = Utf8StreamBuffer::new();
     let mut was_helper_friend_enabled = context.helper_friend.load(Ordering::Relaxed);
@@ -851,10 +858,79 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                                 "Server-to-client presence stanzas are flowing",
                             );
                         }
+                        if let Some(message) = server_presence_stats.record_server_batch(&content) {
+                            log(&context.log_tx, LogCategory::Chat, LogLevel::Info, message);
+                        }
+                        if server_presence_stats.is_warmup_ready() {
+                            if let Some(masked_presence) =
+                                presence_buffer.take_warmup_masked_presence()
+                            {
+                                if !masked_presence.is_empty() {
+                                    log_stream_bytes(
+                                        &context.stream_tx,
+                                        "ghosty -> riot presence warmup mask",
+                                        &masked_presence,
+                                    );
+                                    outgoing.write_all(&masked_presence)?;
+                                }
+                                log(
+                                    &context.log_tx,
+                                    LogCategory::Chat,
+                                    LogLevel::Info,
+                                    "Finished initial presence warmup and restored masked status",
+                                );
+                            }
+                        }
+                        if helper_friend_enabled
+                            && !startup_roster_ready
+                            && !presence::contains_roster_marker(&content)
+                            && content.contains("<presence")
+                            && !helper_injector.is_empty()
+                        {
+                            delayed_startup_presence.extend_from_slice(&bytes_to_client);
+                            if !logged_delayed_startup_presence {
+                                logged_delayed_startup_presence = true;
+                                log(
+                                    &context.log_tx,
+                                    LogCategory::Chat,
+                                    LogLevel::Info,
+                                    "Delayed startup presence until initial roster finished",
+                                );
+                            }
+                            bytes_to_client.clear();
+                            continue;
+                        }
                         if helper_friend_enabled && !inserted_helper_friend {
                             let injection = helper_injector.push(&content);
                             if injection.inserted {
                                 inserted_helper_friend = true;
+                                startup_roster_ready = true;
+                                if !roster_domains_logged {
+                                    roster_domains_logged = true;
+                                    roster_jid_domains = injection.roster_jid_domains.clone();
+                                    if let Some(summary) =
+                                        jid_domain_summary(&content, "jid", "Roster JID domains")
+                                    {
+                                        log(
+                                            &context.log_tx,
+                                            LogCategory::Chat,
+                                            LogLevel::Info,
+                                            summary,
+                                        );
+                                    }
+                                }
+                                if let (Some(before), Some(after)) =
+                                    (injection.roster_items_before, injection.roster_items_after)
+                                {
+                                    log(
+                                        &context.log_tx,
+                                        LogCategory::Chat,
+                                        LogLevel::Info,
+                                        format!(
+                                            "Inserted Ghosty helper into initial roster: received {before} Riot friends and forwarded {after} roster items"
+                                        ),
+                                    );
+                                }
                                 log(
                                     &context.log_tx,
                                     LogCategory::Chat,
@@ -868,11 +944,18 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                             && presence::contains_roster_marker(&content)
                         {
                             logged_roster_without_helper = true;
+                            startup_roster_ready = true;
+                            let roster_items = presence::roster_item_count(&content);
+                            if roster_jid_domains.is_empty() {
+                                roster_jid_domains = jid_domain_map(&content, "jid");
+                            }
                             log(
                                 &context.log_tx,
                                 LogCategory::Chat,
                                 LogLevel::Info,
-                                "Roster marker passed while helper friend was disabled",
+                                format!(
+                                    "Roster marker passed while helper friend was disabled ({roster_items} items in current chunk)"
+                                ),
                             );
                         }
                     }
@@ -887,8 +970,41 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     Utf8Chunk::Pending => {}
                 }
                 if !bytes_to_client.is_empty() {
+                    if !roster_jid_domains.is_empty() {
+                        if let Ok(content) = std::str::from_utf8(&bytes_to_client) {
+                            if let Some(rewritten) = rewrite_jid_attribute_domains_from_map(
+                                content,
+                                "from",
+                                &roster_jid_domains,
+                            ) {
+                                if !logged_presence_domain_normalization {
+                                    logged_presence_domain_normalization = true;
+                                    let before = jid_domains(content, "from");
+                                    let after = jid_domains(&rewritten, "from");
+                                    log(
+                                        &context.log_tx,
+                                        LogCategory::Chat,
+                                        LogLevel::Info,
+                                        format!(
+                                            "Normalized server-to-client JID domains for roster matching: {before} -> {after}"
+                                        ),
+                                    );
+                                }
+                                bytes_to_client = rewritten.into_bytes();
+                            }
+                        }
+                    }
                     log_stream_bytes(&context.stream_tx, "ghosty -> client", &bytes_to_client);
                     incoming.write_all(&bytes_to_client)?;
+                }
+                if startup_roster_ready && !delayed_startup_presence.is_empty() {
+                    let delayed = std::mem::take(&mut delayed_startup_presence);
+                    log_stream_bytes(
+                        &context.stream_tx,
+                        "ghosty -> client delayed startup presence",
+                        &delayed,
+                    );
+                    incoming.write_all(&delayed)?;
                 }
                 if helper_friend_enabled && inserted_helper_friend && !sent_helper_presence {
                     sent_helper_presence = true;
@@ -1142,6 +1258,9 @@ struct HelperFriendInjector {
 struct HelperInjection {
     bytes: Vec<u8>,
     inserted: bool,
+    roster_items_before: Option<usize>,
+    roster_items_after: Option<usize>,
+    roster_jid_domains: std::collections::BTreeMap<String, String>,
 }
 
 impl HelperFriendInjector {
@@ -1156,10 +1275,16 @@ impl HelperFriendInjector {
         self.pending.push_str(content);
 
         if let Some(updated) = presence::insert_helper_friend(&self.pending, &self.helper_jid) {
+            let roster_items_before = presence::roster_item_count(&self.pending);
+            let roster_items_after = presence::roster_item_count(&updated);
+            let roster_jid_domains = jid_domain_map(&self.pending, "jid");
             self.pending.clear();
             return HelperInjection {
                 bytes: updated.into_bytes(),
                 inserted: true,
+                roster_items_before: Some(roster_items_before),
+                roster_items_after: Some(roster_items_after),
+                roster_jid_domains,
             };
         }
 
@@ -1168,6 +1293,9 @@ impl HelperFriendInjector {
             return HelperInjection {
                 bytes: Vec::new(),
                 inserted: false,
+                roster_items_before: None,
+                roster_items_after: None,
+                roster_jid_domains: std::collections::BTreeMap::new(),
             };
         }
 
@@ -1177,6 +1305,9 @@ impl HelperFriendInjector {
         HelperInjection {
             bytes: flush.into_bytes(),
             inserted: false,
+            roster_items_before: None,
+            roster_items_after: None,
+            roster_jid_domains: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1249,6 +1380,123 @@ struct HelperCommandBuffer {
     helper_jid: String,
 }
 
+#[derive(Default)]
+struct PresenceStats {
+    batches_logged: usize,
+    total_presence: usize,
+    total_unavailable: usize,
+    total_show_chat: usize,
+    total_show_dnd: usize,
+    total_show_away: usize,
+    total_show_offline: usize,
+    total_show_mobile: usize,
+    total_league_chat: usize,
+    total_league_dnd: usize,
+    total_league_away: usize,
+    total_league_offline: usize,
+    total_league_mobile: usize,
+}
+
+struct PresenceBatchStats {
+    presence: usize,
+    unavailable: usize,
+    show_chat: usize,
+    show_dnd: usize,
+    show_away: usize,
+    show_offline: usize,
+    show_mobile: usize,
+    league_chat: usize,
+    league_dnd: usize,
+    league_away: usize,
+    league_offline: usize,
+    league_mobile: usize,
+}
+
+impl PresenceStats {
+    const MAX_LOGGED_BATCHES: usize = 12;
+    const WARMUP_MIN_PRESENCE: usize = 40;
+    const WARMUP_MIN_BATCHES: usize = 4;
+
+    fn record_server_batch(&mut self, content: &str) -> Option<String> {
+        let batch = PresenceBatchStats::from_content(content);
+        if batch.presence == 0 {
+            return None;
+        }
+
+        self.total_presence += batch.presence;
+        self.total_unavailable += batch.unavailable;
+        self.total_show_chat += batch.show_chat;
+        self.total_show_dnd += batch.show_dnd;
+        self.total_show_away += batch.show_away;
+        self.total_show_offline += batch.show_offline;
+        self.total_show_mobile += batch.show_mobile;
+        self.total_league_chat += batch.league_chat;
+        self.total_league_dnd += batch.league_dnd;
+        self.total_league_away += batch.league_away;
+        self.total_league_offline += batch.league_offline;
+        self.total_league_mobile += batch.league_mobile;
+
+        if self.batches_logged >= Self::MAX_LOGGED_BATCHES {
+            return None;
+        }
+        self.batches_logged += 1;
+
+        Some(format!(
+            "Server presence batch #{batch_no}: batch={presence} unavailable={unavailable} show(chat/dnd/away/offline/mobile)={show_chat}/{show_dnd}/{show_away}/{show_offline}/{show_mobile} league_st(chat/dnd/away/offline/mobile)={league_chat}/{league_dnd}/{league_away}/{league_offline}/{league_mobile}; domains={domains}; totals presence={total_presence} unavailable={total_unavailable}",
+            batch_no = self.batches_logged,
+            presence = batch.presence,
+            unavailable = batch.unavailable,
+            show_chat = batch.show_chat,
+            show_dnd = batch.show_dnd,
+            show_away = batch.show_away,
+            show_offline = batch.show_offline,
+            show_mobile = batch.show_mobile,
+            league_chat = batch.league_chat,
+            league_dnd = batch.league_dnd,
+            league_away = batch.league_away,
+            league_offline = batch.league_offline,
+            league_mobile = batch.league_mobile,
+            domains = jid_domains(content, "from"),
+            total_presence = self.total_presence,
+            total_unavailable = self.total_unavailable,
+        ))
+    }
+
+    fn is_warmup_ready(&self) -> bool {
+        self.total_league_presence() > 0
+            || self.total_presence >= Self::WARMUP_MIN_PRESENCE
+            || self.batches_logged >= Self::WARMUP_MIN_BATCHES
+    }
+
+    fn total_league_presence(&self) -> usize {
+        self.total_league_chat
+            + self.total_league_dnd
+            + self.total_league_away
+            + self.total_league_offline
+            + self.total_league_mobile
+    }
+}
+
+impl PresenceBatchStats {
+    fn from_content(content: &str) -> Self {
+        Self {
+            presence: count_matches(content, "<presence"),
+            unavailable: count_matches(content, "type='unavailable'")
+                + count_matches(content, "type=\"unavailable\""),
+            show_chat: count_matches(content, "<show>chat</show>"),
+            show_dnd: count_matches(content, "<show>dnd</show>"),
+            show_away: count_matches(content, "<show>away</show>"),
+            show_offline: count_matches(content, "<show>offline</show>"),
+            show_mobile: count_matches(content, "<show>mobile</show>"),
+            league_chat: count_league_st(content, "chat"),
+            league_dnd: count_league_st(content, "dnd"),
+            league_away: count_league_st(content, "away"),
+            league_offline: count_league_st(content, "offline"),
+            league_mobile: count_league_st(content, "mobile"),
+        }
+    }
+}
+
 enum HelperCommandResult {
     NotHelper,
     Pending,
@@ -1319,6 +1567,8 @@ impl HelperCommandBuffer {
 struct ClientPresenceBuffer {
     pending: String,
     settings: Option<BufferedPresenceSettings>,
+    initial_presence_forwarded: bool,
+    warmup_masked_presence: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1335,6 +1585,8 @@ impl ClientPresenceBuffer {
         Self {
             pending: String::new(),
             settings: None,
+            initial_presence_forwarded: false,
+            warmup_masked_presence: None,
         }
     }
 
@@ -1365,6 +1617,19 @@ impl ClientPresenceBuffer {
             target_status,
             connect_to_muc,
         });
+        if settings.target_status != PresenceStatus::Chat
+            && !self.initial_presence_forwarded
+            && presence::contains_unaddressed_presence_fragment(&self.pending)
+        {
+            self.initial_presence_forwarded = true;
+            self.warmup_masked_presence = presence::rewrite_unaddressed_presence_only_fragment(
+                &self.pending,
+                settings.target_status,
+                valorant_version,
+            )?;
+            return Ok(self.flush());
+        }
+
         if let Some(rewrite) = presence::rewrite_presence_fragment(
             &self.pending,
             true,
@@ -1404,6 +1669,15 @@ impl ClientPresenceBuffer {
         self.pending.clear();
         self.settings = None;
     }
+
+    fn take_warmup_masked_presence(&mut self) -> Option<Vec<u8>> {
+        self.warmup_masked_presence.take()
+    }
+
+    #[cfg(test)]
+    fn has_warmup_masked_presence(&self) -> bool {
+        self.warmup_masked_presence.is_some()
+    }
 }
 
 fn should_buffer_presence_fragment(content: &str) -> bool {
@@ -1439,6 +1713,191 @@ fn partial_marker_tail_len(content: &str, marker: &str) -> usize {
         }
     }
     0
+}
+
+fn count_matches(content: &str, needle: &str) -> usize {
+    content.match_indices(needle).count()
+}
+
+fn count_league_st(content: &str, status: &str) -> usize {
+    let needle = format!("<league_of_legends><st>{status}</st>");
+    count_matches(content, &needle)
+}
+
+fn jid_domain_summary(content: &str, attribute: &str, label: &str) -> Option<String> {
+    let domains = jid_domains(content, attribute);
+    (domains != "none").then(|| format!("{label}: {domains}"))
+}
+
+fn jid_domains(content: &str, attribute: &str) -> String {
+    let domains = jid_domain_counts(content, attribute);
+
+    if domains.is_empty() {
+        return "none".to_string();
+    }
+
+    domains
+        .into_iter()
+        .map(|(domain, count)| format!("{domain}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn jid_domain_map(content: &str, attribute: &str) -> std::collections::BTreeMap<String, String> {
+    let mut domains = std::collections::BTreeMap::<String, String>::new();
+    collect_jid_domain_map(content, &format!("{attribute}='"), &mut domains);
+    collect_jid_domain_map(content, &format!("{attribute}=\""), &mut domains);
+    domains
+}
+
+fn jid_domain_counts(content: &str, attribute: &str) -> std::collections::BTreeMap<String, usize> {
+    let mut domains = std::collections::BTreeMap::<String, usize>::new();
+    collect_jid_domains(content, &format!("{attribute}='"), &mut domains);
+    collect_jid_domains(content, &format!("{attribute}=\""), &mut domains);
+    domains
+}
+
+fn collect_jid_domain_map(
+    content: &str,
+    marker: &str,
+    domains: &mut std::collections::BTreeMap<String, String>,
+) {
+    let quote = marker
+        .as_bytes()
+        .last()
+        .copied()
+        .map(char::from)
+        .unwrap_or('\'');
+    let mut offset = 0;
+    while let Some(found) = content[offset..].find(marker) {
+        let value_start = offset + found + marker.len();
+        let value = &content[value_start..];
+        let Some(value_end) = value.find(quote) else {
+            return;
+        };
+        if let Some((local, domain)) = jid_parts(&value[..value_end]) {
+            domains
+                .entry(local.to_string())
+                .or_insert(domain.to_string());
+        }
+        offset = value_start + value_end + 1;
+    }
+}
+
+fn collect_jid_domains(
+    content: &str,
+    marker: &str,
+    domains: &mut std::collections::BTreeMap<String, usize>,
+) {
+    let quote = marker
+        .as_bytes()
+        .last()
+        .copied()
+        .map(char::from)
+        .unwrap_or('\'');
+    let mut offset = 0;
+    while let Some(found) = content[offset..].find(marker) {
+        let value_start = offset + found + marker.len();
+        let value = &content[value_start..];
+        let Some(value_end) = value.find(quote) else {
+            return;
+        };
+        if let Some(domain) = jid_domain(&value[..value_end]) {
+            *domains.entry(domain.to_string()).or_default() += 1;
+        }
+        offset = value_start + value_end + 1;
+    }
+}
+
+fn rewrite_jid_attribute_domains_from_map(
+    content: &str,
+    attribute: &str,
+    roster_domains: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let mut output = String::with_capacity(content.len());
+    let mut remaining = content;
+    let mut changed = false;
+
+    while let Some((start, quote, marker_len)) = next_attribute_marker(remaining, attribute) {
+        output.push_str(&remaining[..start]);
+        output.push_str(&remaining[start..start + marker_len]);
+        let value_start = start + marker_len;
+        let after_marker = &remaining[value_start..];
+        let Some(value_end) = after_marker.find(quote) else {
+            output.push_str(after_marker);
+            return changed.then_some(output);
+        };
+        let value = &after_marker[..value_end];
+        if let Some(rewritten) = rewrite_jid_domain_from_map(value, roster_domains) {
+            output.push_str(&rewritten);
+            changed = true;
+        } else {
+            output.push_str(value);
+        }
+        output.push(quote);
+        remaining = &after_marker[value_end + quote.len_utf8()..];
+    }
+
+    output.push_str(remaining);
+    changed.then_some(output)
+}
+
+fn next_attribute_marker(content: &str, attribute: &str) -> Option<(usize, char, usize)> {
+    let single = format!("{attribute}='");
+    let double = format!("{attribute}=\"");
+    match (content.find(&single), content.find(&double)) {
+        (Some(single_at), Some(double_at)) if single_at <= double_at => {
+            Some((single_at, '\'', single.len()))
+        }
+        (Some(_), Some(double_at)) => Some((double_at, '"', double.len())),
+        (Some(single_at), None) => Some((single_at, '\'', single.len())),
+        (None, Some(double_at)) => Some((double_at, '"', double.len())),
+        (None, None) => None,
+    }
+}
+
+fn rewrite_jid_domain_from_map(
+    jid: &str,
+    roster_domains: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let (local, current_domain) = jid_parts(jid)?;
+    let target_domain = roster_domains.get(local)?;
+    if current_domain == target_domain
+        || current_domain == "conference.pvp.net"
+        || !current_domain.ends_with(".pvp.net")
+        || !target_domain.ends_with(".pvp.net")
+    {
+        return None;
+    }
+
+    let domain_start = jid.find('@')? + 1;
+    let domain = &jid[domain_start..];
+    let domain_end = domain.find('/').unwrap_or(domain.len());
+    let mut rewritten = String::with_capacity(jid.len() + target_domain.len());
+    rewritten.push_str(&jid[..domain_start]);
+    rewritten.push_str(target_domain);
+    rewritten.push_str(&domain[domain_end..]);
+    Some(rewritten)
+}
+
+fn jid_parts(jid: &str) -> Option<(&str, &str)> {
+    let domain_start = jid.find('@')?;
+    let local = &jid[..domain_start];
+    if local.is_empty() {
+        return None;
+    }
+    let domain = &jid[domain_start + 1..];
+    let domain_end = domain.find('/').unwrap_or(domain.len());
+    let domain = &domain[..domain_end];
+    (!domain.is_empty()).then_some((local, domain))
+}
+
+fn jid_domain(jid: &str) -> Option<&str> {
+    let domain_start = jid.find('@')? + 1;
+    let domain = &jid[domain_start..];
+    let domain_end = domain.find('/').unwrap_or(domain.len());
+    let domain = &domain[..domain_end];
+    (!domain.is_empty()).then_some(domain)
 }
 
 fn possible_roster_prefix_len(content: &str) -> usize {
@@ -1819,6 +2278,7 @@ fn sanitize_stream_text(text: &str) -> String {
         .replace('\t', "\\t");
     sanitized = redact_xml_element(&sanitized, "auth");
     sanitized = redact_xml_element(&sanitized, "password");
+    sanitized = redact_xml_element(&sanitized, "token");
     sanitized = redact_attribute(&sanitized, "password");
     sanitized = redact_attribute(&sanitized, "token");
     sanitized = redact_attribute(&sanitized, "access_token");
@@ -2921,6 +3381,7 @@ mod tests {
     fn client_presence_buffer_rewrites_after_split_multibyte_character() {
         let mut utf8 = Utf8StreamBuffer::new();
         let mut presence = ClientPresenceBuffer::new();
+        presence.initial_presence_forwarded = true;
         let mut valorant_version = None;
         let content = "<presence><show>chat</show><status>olé</status></presence>";
         let split_at = content
@@ -2967,6 +3428,7 @@ mod tests {
     #[test]
     fn client_presence_buffer_rewrites_split_presence() {
         let mut buffer = ClientPresenceBuffer::new();
+        buffer.initial_presence_forwarded = true;
         let mut valorant_version = None;
 
         let first = buffer
@@ -2992,13 +3454,49 @@ mod tests {
         let rewritten = String::from_utf8(second).expect("presence should remain utf8");
 
         assert!(rewritten.contains("<show>offline</show>"));
-        assert!(!rewritten.contains("league_of_legends"));
+        assert!(rewritten.contains("<league_of_legends>"));
+        assert!(rewritten.contains("<st>offline</st>"));
         assert!(!rewritten.contains("<status>"));
+    }
+
+    #[test]
+    fn client_presence_buffer_forwards_initial_presence_then_stores_masked_followup() {
+        let mut buffer = ClientPresenceBuffer::new();
+        let mut valorant_version = None;
+
+        let output = buffer
+            .push(
+                "<iq type='get' id='1'/><presence><games><league_of_legends><st>chat</st></league_of_legends></games><show>chat</show><status>hello</status></presence>",
+                true,
+                PresenceStatus::Offline,
+                true,
+                &mut valorant_version,
+            )
+            .expect("initial presence should not fail");
+        let output = String::from_utf8(output).expect("presence should remain utf8");
+
+        assert!(output.contains("<iq type='get' id='1'/>"));
+        assert!(output.contains("<show>chat</show>"));
+        assert!(output.contains("<status>hello</status>"));
+        assert!(buffer.has_warmup_masked_presence());
+
+        let masked = String::from_utf8(
+            buffer
+                .take_warmup_masked_presence()
+                .expect("masked followup should be cached"),
+        )
+        .expect("masked followup should remain utf8");
+
+        assert!(masked.contains("<show>offline</show>"));
+        assert!(masked.contains("<st>offline</st>"));
+        assert!(!masked.contains("<iq"));
+        assert!(!masked.contains("<status>hello</status>"));
     }
 
     #[test]
     fn client_presence_buffer_uses_initial_status_for_split_presence() {
         let mut buffer = ClientPresenceBuffer::new();
+        buffer.initial_presence_forwarded = true;
         let mut valorant_version = None;
 
         let first = buffer
@@ -3082,6 +3580,7 @@ mod tests {
     #[test]
     fn client_presence_buffer_waits_for_split_presence_marker() {
         let mut buffer = ClientPresenceBuffer::new();
+        buffer.initial_presence_forwarded = true;
         let mut valorant_version = None;
 
         let first = buffer
@@ -3130,6 +3629,7 @@ mod tests {
     #[test]
     fn client_presence_buffer_rewrites_presence_inside_batched_stanzas() {
         let mut buffer = ClientPresenceBuffer::new();
+        buffer.initial_presence_forwarded = true;
         let mut valorant_version = None;
 
         let output = buffer
@@ -3146,6 +3646,104 @@ mod tests {
         assert!(rewritten.contains("<message"));
         assert!(rewritten.contains("<show>offline</show>"));
         assert!(!rewritten.contains("<status>hello</status>"));
+    }
+
+    #[test]
+    fn server_presence_stats_summarizes_friend_status_batches() {
+        let mut stats = PresenceStats::default();
+        let message = stats
+            .record_server_batch(
+                "<presence from='a@na2.pvp.net'><games><league_of_legends><st>chat</st></league_of_legends></games><show>chat</show></presence>\
+                 <presence from='b@na2.pvp.net' type='unavailable'/>\
+                 <presence from='c@na2.pvp.net'><games><league_of_legends><st>dnd</st></league_of_legends></games><show>dnd</show></presence>",
+            )
+            .expect("presence batch should be logged");
+
+        assert!(message.contains("batch=3"));
+        assert!(message.contains("unavailable=1"));
+        assert!(message.contains("show(chat/dnd/away/offline/mobile)=1/1/0/0/0"));
+        assert!(message.contains("league_st(chat/dnd/away/offline/mobile)=1/1/0/0/0"));
+        assert!(message.contains("domains=na2.pvp.net=3"));
+        assert_eq!(stats.total_presence, 3);
+        assert_eq!(stats.total_unavailable, 1);
+    }
+
+    #[test]
+    fn server_presence_stats_marks_warmup_ready_after_presence_fanout() {
+        let mut stats = PresenceStats::default();
+
+        assert!(!stats.is_warmup_ready());
+        let _ = stats.record_server_batch(
+            "<presence from='a@na2.pvp.net'><show>chat</show></presence>\
+             <presence from='b@na2.pvp.net'><show>dnd</show></presence>",
+        );
+        assert!(!stats.is_warmup_ready());
+        let _ = stats.record_server_batch(
+            "<presence from='c@na2.pvp.net'><games><league_of_legends><st>chat</st></league_of_legends></games><show>chat</show></presence>",
+        );
+
+        assert!(stats.is_warmup_ready());
+    }
+
+    #[test]
+    fn jid_domains_summarizes_roster_and_presence_domains() {
+        assert_eq!(
+            jid_domains(
+                "<item jid='one@na1.pvp.net'/><item jid=\"two@na2.pvp.net/resource\"/><presence from='three@na1.pvp.net/RC'/>",
+                "jid"
+            ),
+            "na1.pvp.net=1,na2.pvp.net=1"
+        );
+        assert_eq!(
+            jid_domains(
+                "<item jid='one@na1.pvp.net'/><presence from='three@na1.pvp.net/RC'/>",
+                "from"
+            ),
+            "na1.pvp.net=1"
+        );
+    }
+
+    #[test]
+    fn rewrites_server_jid_domains_to_match_roster_jids_per_user() {
+        let roster_domains = jid_domain_map(
+            "<item jid='friend@na1.pvp.net'/><item jid='other@eu1.pvp.net'/>",
+            "jid",
+        );
+        let rewritten = rewrite_jid_attribute_domains_from_map(
+            "<presence from='friend@na2.pvp.net/RC'><show>chat</show></presence>\
+             <message from=\"other@na2.pvp.net/mobile\"/>\
+             <message from='unknown@na2.pvp.net/mobile'/>\
+             <presence from='room@conference.pvp.net/user'/>",
+            "from",
+            &roster_domains,
+        )
+        .expect("domain mismatch should be rewritten");
+
+        assert!(rewritten.contains("friend@na1.pvp.net/RC"));
+        assert!(rewritten.contains("other@eu1.pvp.net/mobile"));
+        assert!(rewritten.contains("unknown@na2.pvp.net/mobile"));
+        assert!(rewritten.contains("room@conference.pvp.net/user"));
+        assert!(!rewritten.contains("friend@na2.pvp.net"));
+    }
+
+    #[test]
+    fn jid_domain_map_preserves_each_roster_jid_domain() {
+        let domains = jid_domain_map(
+            "<item jid='a@na1.pvp.net'/><item jid='b@na1.pvp.net'/><item jid='c@na2.pvp.net'/>",
+            "jid",
+        );
+        assert_eq!(domains.get("a").map(String::as_str), Some("na1.pvp.net"));
+        assert_eq!(domains.get("c").map(String::as_str), Some("na2.pvp.net"));
+    }
+
+    #[test]
+    fn stream_preview_redacts_entitlement_tokens() {
+        let preview = stream_preview(
+            b"<iq><entitlements><token>super-secret.jwt.payload</token></entitlements></iq>",
+        );
+
+        assert!(preview.contains("<token>[redacted]</token>"));
+        assert!(!preview.contains("super-secret"));
     }
 
     #[test]
@@ -3220,6 +3818,41 @@ mod tests {
         assert!(second.inserted);
         assert!(output.contains("Ghosty Active!"));
         assert!(output.contains("friend@na2.pvp.net"));
+    }
+
+    #[test]
+    fn helper_injector_preserves_large_roster_split_across_many_chunks() {
+        let mut injector = HelperFriendInjector::new(TEST_HELPER_JID.to_string());
+        let friend_count = 500;
+        let mut roster =
+            "<iq type='result' id='roster'><query xmlns='jabber:iq:riotgames:roster'>".to_string();
+        for index in 0..friend_count {
+            roster.push_str(&format!(
+                "<item jid='friend-{index}@na2.pvp.net' name='Friend {index}' subscription='both'/>"
+            ));
+        }
+        roster.push_str("</query></iq>");
+
+        let mut forwarded = Vec::new();
+        let mut inserted = None;
+        for chunk in roster.as_bytes().chunks(37) {
+            let content = std::str::from_utf8(chunk).expect("test roster should stay utf-8");
+            let injection = injector.push(content);
+            if injection.inserted {
+                inserted = Some((injection.roster_items_before, injection.roster_items_after));
+            }
+            forwarded.extend(injection.bytes);
+        }
+        forwarded.extend(injector.flush());
+        let output = String::from_utf8(forwarded).expect("forwarded roster should stay utf-8");
+
+        assert_eq!(inserted, Some((Some(friend_count), Some(friend_count + 1))));
+        assert_eq!(presence::roster_item_count(&output), friend_count + 1);
+        for index in 0..friend_count {
+            assert!(output.contains(&format!("friend-{index}@na2.pvp.net")));
+        }
+        assert!(output.contains("Ghosty Active!"));
+        assert!(output.contains("</query></iq>"));
     }
 
     #[test]
