@@ -60,6 +60,17 @@
     preview: string;
   };
 
+  type LcuApiResponse = {
+    method: string;
+    endpoint: string;
+    url: string;
+    port: number;
+    status: number;
+    ok: boolean;
+    body: unknown | null;
+    text: string;
+  };
+
   type PreflightReport = {
     ok: boolean;
     checks: Array<{ label: string; ok: boolean; detail: string }>;
@@ -106,6 +117,22 @@
     { id: "chat", label: "Online" }
   ];
 
+  const lcuMethods = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+  const lcuEndpoints: Array<{ path: string; label: string }> = [
+    { path: "/lol-summoner/v1/current-summoner", label: "Current Summoner" },
+    { path: "/lol-chat/v1/me", label: "Chat Me" },
+    { path: "/lol-chat/v1/friends", label: "Friends" },
+    { path: "/lol-gameflow/v1/gameflow-phase", label: "Gameflow Phase" },
+    { path: "/lol-gameflow/v1/session", label: "Gameflow Session" },
+    { path: "/lol-champ-select/v1/session", label: "Champ Select Session" },
+    { path: "/lol-lobby/v2/lobby", label: "Lobby" },
+    { path: "/lol-login/v1/session", label: "Login Session" },
+    { path: "/lol-platform-config/v1/namespaces", label: "Platform Config Namespaces" },
+    { path: "/lol-store/v1/wallet", label: "Wallet" },
+    { path: "/riotclient/region-locale", label: "Region Locale" },
+    { path: "/riotclient/ux-state", label: "Riot UX State" }
+  ];
+
   let snapshot = $state<AppSnapshot>({
     running: false,
     enabled: true,
@@ -141,6 +168,10 @@
   let pendingRiotProcesses = $state<string[]>([]);
   let streamAutoScroll = $state(true);
   let streamLogElement = $state<HTMLDivElement | null>(null);
+  let lcuMethod = $state("GET");
+  let lcuEndpoint = $state("/lol-summoner/v1/current-summoner");
+  let lcuBody = $state("");
+  let lcuResponse = $state<LcuApiResponse | null>(null);
   let lastStreamEventCount = 0;
   let snapshotRequestId = 0;
   let launchFormInitialized = false;
@@ -349,6 +380,27 @@
     });
   }
 
+  async function callLcuApi() {
+    let body: unknown | null;
+    try {
+      body = parseLcuBody();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      throw err;
+    }
+    const response = await call(() =>
+      invoke<LcuApiResponse>("call_lcu_api", {
+        method: lcuMethod,
+        endpoint: lcuEndpoint,
+        body
+      })
+    );
+    if (response) {
+      lcuResponse = response;
+      notice = response.ok ? `League Client API returned ${response.status}.` : `League Client API returned HTTP ${response.status}.`;
+    }
+  }
+
   function minimizeWindow() {
     void appWindow.minimize();
   }
@@ -435,6 +487,27 @@
 
   function presenceLabel(status: PresenceStatus) {
     return statuses.find((item) => item.id === status)?.label ?? status;
+  }
+
+  function lcuResponseText() {
+    if (!lcuResponse) {
+      return "";
+    }
+    if (lcuResponse.body !== null) {
+      return JSON.stringify(lcuResponse.body, null, 2);
+    }
+    return lcuResponse.text;
+  }
+
+  function parseLcuBody() {
+    if (lcuMethod === "GET" || lcuMethod === "DELETE" || !lcuBody.trim()) {
+      return null;
+    }
+    try {
+      return JSON.parse(lcuBody);
+    } catch (err) {
+      throw new Error(`Body must be valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   function selectGame(game: LaunchGame) {
@@ -821,6 +894,53 @@
           <dd>{snapshot.riotClientPath ?? "Not found yet"}</dd>
         </div>
       </dl>
+    </div>
+
+    <div class="panel lcu-api-panel">
+      <div class="panel-title">
+        <Activity size={18} />
+        <h2>League Client API</h2>
+      </div>
+      <label class="field">
+        <span>Endpoint</span>
+        <select value={lcuEndpoint} onchange={(event) => (lcuEndpoint = event.currentTarget.value)}>
+          {#each lcuEndpoints as endpoint}
+            <option value={endpoint.path}>{endpoint.label}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="field">
+        <span>Method</span>
+        <select value={lcuMethod} onchange={(event) => (lcuMethod = event.currentTarget.value)}>
+          {#each lcuMethods as method}
+            <option value={method}>{method}</option>
+          {/each}
+        </select>
+      </label>
+      <label class="field">
+        <span>Path</span>
+        <input value={lcuEndpoint} oninput={(event) => (lcuEndpoint = event.currentTarget.value)} placeholder="/lol-summoner/v1/current-summoner" />
+      </label>
+      {#if lcuMethod !== "GET" && lcuMethod !== "DELETE"}
+        <label class="field">
+          <span>JSON Body</span>
+          <textarea value={lcuBody} oninput={(event) => (lcuBody = event.currentTarget.value)} placeholder={`{ "key": "value" }`}></textarea>
+        </label>
+      {/if}
+      <div class="button-row">
+        <button class="primary" disabled={busy} type="button" onclick={() => runAction(callLcuApi)}>
+          <Search size={17} /> Call Endpoint
+        </button>
+      </div>
+      {#if lcuResponse}
+        <div class="api-result">
+          <div class="api-result-meta">
+            <span class:ok={lcuResponse.ok}>{lcuResponse.status}</span>
+            <strong>{lcuResponse.method} {lcuResponse.endpoint}</strong>
+          </div>
+          <pre>{lcuResponseText()}</pre>
+        </div>
+      {/if}
     </div>
 
     <div class="panel log-panel">
@@ -1371,7 +1491,9 @@
     font-weight: 700;
   }
 
-  .field input {
+  .field input,
+  .field select,
+  .field textarea {
     width: 100%;
     min-height: 38px;
     border: 1px solid #ccd4dd;
@@ -1379,6 +1501,24 @@
     background: #fff;
     color: #1c2430;
     padding: 0 10px;
+  }
+
+  .field textarea {
+    min-height: 88px;
+    padding: 9px 10px;
+    resize: vertical;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  .field select {
+    appearance: none;
+    background:
+      linear-gradient(45deg, transparent 50%, #657382 50%) calc(100% - 16px) 16px / 6px 6px no-repeat,
+      linear-gradient(135deg, #657382 50%, transparent 50%) calc(100% - 10px) 16px / 6px 6px no-repeat,
+      #fff;
+    padding-right: 30px;
   }
 
   .field input[aria-invalid="true"] {
@@ -1632,6 +1772,64 @@
     overflow-wrap: anywhere;
     color: #1f2d3b;
     font-size: 13px;
+  }
+
+  .api-result {
+    display: grid;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .api-result-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    color: #405060;
+    font-size: 12px;
+  }
+
+  .api-result-meta span {
+    min-width: 44px;
+    border: 1px solid #e1a4a4;
+    border-radius: 7px;
+    background: #fff3f3;
+    color: #8b1e1e;
+    padding: 4px 7px;
+    text-align: center;
+    font-weight: 850;
+  }
+
+  .api-result-meta span.ok {
+    border-color: #9fd0b7;
+    background: #effaf4;
+    color: #14633f;
+  }
+
+  .api-result-meta strong {
+    min-width: 0;
+    overflow: hidden;
+    color: #263442;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .api-result pre {
+    max-height: 300px;
+    margin: 0;
+    overflow: auto;
+    border: 1px solid #d6dde5;
+    border-radius: 8px;
+    background: #101820;
+    color: #d7e2ee;
+    padding: 10px;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    scrollbar-color: #52657a #121c26;
+    scrollbar-width: thin;
   }
 
   .log {

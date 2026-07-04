@@ -9,7 +9,7 @@ use crate::models::PresenceStatus;
 
 const HELPER_PUUID: &str = "41c322a1-b328-495b-a004-5ccd3e45eae8";
 const HELPER_NAME: &str = "Ghosty Active!";
-const HELPER_PROFILE_ICON: &str = "784";
+const HELPER_PROFILE_ICON: &str = "3151";
 pub const ROSTER_NAMESPACE: &str = "jabber:iq:riotgames:roster";
 
 pub enum PresenceRewrite {
@@ -610,8 +610,10 @@ mod tests {
         let league_payload: String =
             serde_json::from_str(&decoded).expect("League payload should be a JSON string");
 
-        assert!(league_payload.contains("\"profileIcon\": \"3151\""));
-        assert!(league_payload.contains("\"gameStatus\": \"outOfGame\""));
+        let league_payload: Value =
+            serde_json::from_str(&league_payload).expect("League payload should be JSON");
+        assert_eq!(league_payload["profileIcon"], "3151");
+        assert_eq!(league_payload["gameStatus"], "outOfGame");
 
         let encoded = presence
             .split("<valorant>")

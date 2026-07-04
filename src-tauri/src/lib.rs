@@ -1,4 +1,5 @@
 mod config_proxy;
+mod lcu_api;
 mod models;
 mod persistence;
 mod presence;
@@ -38,6 +39,15 @@ fn kill_riot_processes(state: State<'_, SharedState>) -> Result<AppSnapshot, Str
 #[tauri::command]
 fn running_riot_processes() -> Result<Vec<String>, String> {
     riot::running_riot_processes().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn call_lcu_api(
+    method: String,
+    endpoint: String,
+    body: Option<serde_json::Value>,
+) -> Result<lcu_api::LcuApiResponse, String> {
+    lcu_api::call_endpoint(&method, &endpoint, body).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -171,6 +181,7 @@ pub fn run() {
             locate_riot_client,
             kill_riot_processes,
             running_riot_processes,
+            call_lcu_api,
             run_preflight,
             start_deceive,
             clean_restart,
