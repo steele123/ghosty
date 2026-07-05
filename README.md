@@ -7,6 +7,10 @@ or mobile while keeping lobby and select chat available.
 
 Inspired by [molenzwiebel/Deceive](https://github.com/molenzwiebel/Deceive).
 
+## Download
+
+Download the latest Windows installer from the [latest Ghosty release](https://github.com/steele123/ghosty/releases/latest).
+
 ## Features
 
 - Tauri desktop control panel built with Svelte 5.

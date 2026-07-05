@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { getVersion } from "@tauri-apps/api/app";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { relaunch } from "@tauri-apps/plugin-process";
@@ -184,6 +185,7 @@
   let lcuEndpoint = $state("/lol-summoner/v1/current-summoner");
   let lcuBody = $state("");
   let lcuResponse = $state<LcuApiResponse | null>(null);
+  let appVersion = $state("");
   let updateCheckStarted = false;
   let lastStreamEventCount = 0;
   let snapshotRequestId = 0;
@@ -195,6 +197,7 @@
 
   onMount(() => {
     restoreLaunchForm();
+    void loadAppVersion();
     void refresh();
     void checkForUpdates();
     const interval = window.setInterval(() => void refresh(), 1500);
@@ -213,6 +216,17 @@
     runAction(() => action(checked), () => {
       input.checked = currentValue;
     });
+  }
+
+  async function loadAppVersion() {
+    if (!appWindow) {
+      return;
+    }
+    try {
+      appVersion = await getVersion();
+    } catch {
+      appVersion = "";
+    }
   }
 
   async function call<T>(action: () => Promise<T>) {
@@ -628,6 +642,9 @@
     <img class="brand-mark" data-tauri-drag-region src="/icon.png" alt="" />
     <div class="title-copy" data-tauri-drag-region>
       <strong data-tauri-drag-region>Ghosty</strong>
+      {#if appVersion}
+        <span class="app-version" data-tauri-drag-region>v{appVersion}</span>
+      {/if}
     </div>
     <div class="title-status" data-tauri-drag-region>
       <Badge class={`title-status-chip ${snapshot.running ? "online" : ""}`} variant="outline" data-tauri-drag-region>
