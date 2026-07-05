@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, process::Command, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -8,6 +12,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sysinfo::System;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,13 +33,31 @@ struct LcuAuthInfo {
     password: String,
 }
 
+static LCU_AUTH_CACHE: OnceLock<Mutex<Option<LcuAuthInfo>>> = OnceLock::new();
+
 pub fn call_endpoint(method: &str, endpoint: &str, body: Option<Value>) -> Result<LcuApiResponse> {
     let method = normalize_method(method)?;
     let endpoint = normalize_endpoint(endpoint)?;
-    let auth = find_auth_info()?;
+    let auth = cached_auth_info()?;
+    match call_endpoint_with_auth(&method, &endpoint, body.clone(), &auth) {
+        Ok(response) if !auth_response_needs_refresh(&response) => Ok(response),
+        Ok(_) | Err(_) => {
+            clear_auth_cache();
+            let auth = refresh_auth_info()?;
+            call_endpoint_with_auth(&method, &endpoint, body, &auth)
+        }
+    }
+}
+
+fn call_endpoint_with_auth(
+    method: &str,
+    endpoint: &str,
+    body: Option<Value>,
+    auth: &LcuAuthInfo,
+) -> Result<LcuApiResponse> {
     let url = format!("https://127.0.0.1:{}{endpoint}", auth.port);
-    let client = build_client(&auth)?;
-    let request = request_builder(&client, &method, &url, body)?;
+    let client = build_client(auth)?;
+    let request = request_builder(&client, method, &url, body)?;
     let response = request
         .send()
         .with_context(|| format!("Unable to call League Client API at {url}"))?;
@@ -45,8 +68,8 @@ pub fn call_endpoint(method: &str, endpoint: &str, body: Option<Value>) -> Resul
     let body = serde_json::from_str(&text).ok();
 
     Ok(LcuApiResponse {
-        method,
-        endpoint,
+        method: method.to_string(),
+        endpoint: endpoint.to_string(),
         url,
         port: auth.port,
         status: status.as_u16(),
@@ -54,6 +77,10 @@ pub fn call_endpoint(method: &str, endpoint: &str, body: Option<Value>) -> Resul
         body,
         text,
     })
+}
+
+fn auth_response_needs_refresh(response: &LcuApiResponse) -> bool {
+    matches!(response.status, 401 | 403)
 }
 
 #[cfg(not(test))]
@@ -461,52 +488,55 @@ fn find_auth_info() -> Result<LcuAuthInfo> {
         })
 }
 
-fn league_client_command_lines() -> Result<Vec<String>> {
-    let output = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-CimInstance Win32_Process -Filter \"Name = 'LeagueClientUx.exe'\").CommandLine | ConvertTo-Json -Compress",
-        ])
-        .output()
-        .context("Unable to query LeagueClientUx.exe command line")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!(
-            "Unable to query LeagueClientUx.exe command line: {}",
-            if stderr.is_empty() {
-                output.status.to_string()
-            } else {
-                stderr
-            }
-        ));
+fn cached_auth_info() -> Result<LcuAuthInfo> {
+    if let Some(auth) = auth_cache()
+        .lock()
+        .map_err(|e| anyhow!("Unable to read League Client auth cache: {e}"))?
+        .clone()
+    {
+        return Ok(auth);
     }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return Ok(Vec::new());
-    }
-    parse_command_line_json(&stdout)
+    refresh_auth_info()
 }
 
-fn parse_command_line_json(output: &str) -> Result<Vec<String>> {
-    let value: Value =
-        serde_json::from_str(output).context("Unable to parse LeagueClientUx command line JSON")?;
-    Ok(match value {
-        Value::String(line) => vec![line],
-        Value::Array(lines) => lines
-            .into_iter()
-            .filter_map(|line| line.as_str().map(ToOwned::to_owned))
-            .collect(),
-        Value::Null => Vec::new(),
-        _ => {
-            return Err(anyhow!(
-                "Unexpected LeagueClientUx command line query output: {output}"
-            ))
-        }
-    })
+fn refresh_auth_info() -> Result<LcuAuthInfo> {
+    let auth = find_auth_info()?;
+    *auth_cache()
+        .lock()
+        .map_err(|e| anyhow!("Unable to update League Client auth cache: {e}"))? = Some(auth.clone());
+    Ok(auth)
+}
+
+fn clear_auth_cache() {
+    if let Ok(mut cache) = auth_cache().lock() {
+        *cache = None;
+    }
+}
+
+fn auth_cache() -> &'static Mutex<Option<LcuAuthInfo>> {
+    LCU_AUTH_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn league_client_command_lines() -> Result<Vec<String>> {
+    Ok(System::new_all()
+        .processes()
+        .values()
+        .filter(|process| {
+            process
+                .name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("LeagueClientUx.exe")
+        })
+        .map(|process| {
+            process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|line| !line.trim().is_empty())
+        .collect())
 }
 
 fn auth_info_from_command_line(command_line: &str) -> Option<LcuAuthInfo> {
@@ -578,8 +608,7 @@ mod tests {
     use super::{
         auth_info_from_command_line, build_opgg_multisearch_link, build_opgg_summoner_link,
         current_summoner_riot_id, format_friends_summary, friends_from_value, normalize_endpoint,
-        normalize_method, opgg_region_slug, parse_arg_value, parse_command_line_json,
-        riot_ids_from_chat_participants,
+        normalize_method, opgg_region_slug, parse_arg_value, riot_ids_from_chat_participants,
     };
     use serde_json::json;
 
@@ -619,19 +648,6 @@ mod tests {
         assert!(normalize_endpoint("../lol-chat/v1/friends").is_err());
         assert!(normalize_endpoint("/lol-chat/v1/friends#fragment").is_err());
         assert!(normalize_method("TRACE").is_err());
-    }
-
-    #[test]
-    fn parses_powershell_json_shapes() {
-        assert_eq!(
-            parse_command_line_json(r#""one command line""#).unwrap(),
-            vec!["one command line"]
-        );
-        assert_eq!(
-            parse_command_line_json(r#"["one","two"]"#).unwrap(),
-            vec!["one", "two"]
-        );
-        assert!(parse_command_line_json("null").unwrap().is_empty());
     }
 
     #[test]

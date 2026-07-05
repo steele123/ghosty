@@ -1,11 +1,12 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Command,
 };
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
+use sysinfo::{Signal, System};
 
 use crate::models::LaunchGame;
 
@@ -108,69 +109,63 @@ fn validate_game_patchline(game_patchline: &str) -> Result<&str> {
 }
 
 pub fn kill_riot_processes() -> Result<()> {
-    for name in RIOT_PROCESS_NAMES {
-        let image_name = format!("{name}.exe");
-        let output = Command::new("taskkill")
-            .args(["/FI", &format!("IMAGENAME eq {image_name}"), "/T", "/F"])
-            .output()
-            .with_context(|| format!("Unable to run taskkill for {name}"))?;
-        ensure_taskkill_result(name, &output)?;
-    }
+    let system = System::new_all();
+    let mut failures = Vec::new();
 
-    Ok(())
-}
-
-fn ensure_taskkill_result(name: &str, output: &Output) -> Result<()> {
-    if output.status.success() || taskkill_output_means_no_process(output) {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if stderr.is_empty() { stdout } else { stderr };
-    Err(anyhow!(
-        "Unable to stop {name}: taskkill exited with {}{}",
-        output.status,
-        if detail.is_empty() {
-            String::new()
-        } else {
-            format!(" ({detail})")
+    for process in system.processes().values() {
+        if !process_name_matches_riot_target(&process.name().to_string_lossy()) {
+            continue;
         }
-    ))
-}
+        let killed = process
+            .kill_with(Signal::Kill)
+            .unwrap_or_else(|| process.kill());
+        if !killed {
+            failures.push(process.name().to_string_lossy().to_string());
+        }
+    }
 
-fn taskkill_output_means_no_process(output: &Output) -> bool {
-    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    stdout.contains("no tasks are running")
-        || stderr.contains("not found")
-        || stderr.contains("no running instance")
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        failures.sort();
+        failures.dedup();
+        Err(anyhow!(
+            "Unable to stop Riot processes: {}",
+            failures.join(", ")
+        ))
+    }
 }
 
 pub fn running_riot_processes() -> Result<Vec<String>> {
-    let mut running = Vec::new();
-    for name in RIOT_PROCESS_NAMES {
-        let output = Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {name}.exe")])
-            .output()
-            .with_context(|| format!("Unable to run tasklist for {name}"))?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Unable to query {name}: tasklist exited with {}",
-                output.status
-            ));
-        }
-        if tasklist_output_has_process(name, &output) {
-            running.push(name.to_string());
-        }
-    }
+    let system = System::new_all();
+    let mut running = system
+        .processes()
+        .values()
+        .filter_map(|process| {
+            let process_name = process.name().to_string_lossy();
+            let normalized = process_name.to_ascii_lowercase();
+            riot_process_targets()
+                .iter()
+                .position(|target| target == &normalized)
+                .map(|index| RIOT_PROCESS_NAMES[index].to_string())
+        })
+        .collect::<Vec<_>>();
+    running.sort();
+    running.dedup();
     Ok(running)
 }
 
-fn tasklist_output_has_process(name: &str, output: &Output) -> bool {
-    String::from_utf8_lossy(&output.stdout)
-        .to_ascii_lowercase()
-        .contains(&format!("{}.exe", name.to_ascii_lowercase()))
+fn riot_process_targets() -> Vec<String> {
+    RIOT_PROCESS_NAMES
+        .into_iter()
+        .map(|name| format!("{}.exe", name.to_ascii_lowercase()))
+        .collect()
+}
+
+fn process_name_matches_riot_target(name: &str) -> bool {
+    let targets = riot_process_targets();
+    let normalized = name.to_ascii_lowercase();
+    targets.iter().any(|target| target == &normalized)
 }
 
 pub fn ensure_riot_client() -> Result<PathBuf> {
@@ -298,15 +293,6 @@ fn parse_launch_args(value: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::windows::process::ExitStatusExt;
-
-    fn command_output(exit_code: u32, stdout: &str, stderr: &str) -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(exit_code),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
 
     #[test]
     fn riot_client_executable_candidate_keeps_direct_exe_path() {
@@ -448,42 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn taskkill_output_treats_no_matching_tasks_as_ok() {
-        let output = command_output(
-            128,
-            "INFO: No tasks are running which match the specified criteria.\r\n",
-            "",
-        );
-
-        assert!(taskkill_output_means_no_process(&output));
-        assert!(ensure_taskkill_result("LeagueClient", &output).is_ok());
-    }
-
-    #[test]
-    fn taskkill_output_reports_real_failure() {
-        let output = command_output(5, "", "ERROR: Access is denied.\r\n");
-
-        assert!(!taskkill_output_means_no_process(&output));
-        let error = ensure_taskkill_result("LeagueClient", &output)
-            .expect_err("access denied should fail")
-            .to_string();
-        assert!(error.contains("LeagueClient"));
-        assert!(error.contains("Access is denied"));
-    }
-
-    #[test]
-    fn tasklist_output_detects_matching_process() {
-        let output = command_output(
-            0,
-            "Image Name                     PID Session Name        Session#    Mem Usage\r\nRiotClientServices.exe       123 Console                    1     42,000 K\r\n",
-            "",
-        );
-
-        assert!(tasklist_output_has_process("RiotClientServices", &output));
-        assert!(!tasklist_output_has_process("LeagueClient", &output));
-    }
-
-    #[test]
     fn riot_process_list_includes_client_ui_processes() {
         assert!(RIOT_PROCESS_NAMES.contains(&"RiotClientUx"));
         assert!(RIOT_PROCESS_NAMES.contains(&"LeagueClientUx"));
@@ -491,25 +441,17 @@ mod tests {
     }
 
     #[test]
-    fn tasklist_output_detects_riot_client_ui_process() {
-        let output = command_output(
-            0,
-            "Image Name                     PID Session Name        Session#    Mem Usage\r\nRiotClientUx.exe             456 Console                    1     80,000 K\r\n",
-            "",
-        );
-
-        assert!(tasklist_output_has_process("RiotClientUx", &output));
-        assert!(!tasklist_output_has_process("RiotClientServices", &output));
+    fn riot_process_matcher_detects_client_ui_processes() {
+        assert!(process_name_matches_riot_target("RiotClientUx.exe"));
+        assert!(process_name_matches_riot_target("LeagueClientUx.exe"));
+        assert!(process_name_matches_riot_target("LeagueClientUxRender.exe"));
     }
 
     #[test]
-    fn tasklist_output_ignores_no_matching_tasks() {
-        let output = command_output(
-            0,
-            "INFO: No tasks are running which match the specified criteria.\r\n",
-            "",
-        );
-
-        assert!(!tasklist_output_has_process("RiotClientServices", &output));
+    fn riot_process_matcher_is_case_insensitive_and_exact() {
+        assert!(process_name_matches_riot_target("riotclientservices.exe"));
+        assert!(process_name_matches_riot_target("VALORANT-Win64-Shipping.exe"));
+        assert!(!process_name_matches_riot_target("RiotClientServicesHelper.exe"));
+        assert!(!process_name_matches_riot_target("LeagueClient"));
     }
 }
