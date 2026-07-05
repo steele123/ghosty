@@ -49,6 +49,7 @@ pub struct AppState {
     auto_accept: Arc<AtomicBool>,
     auto_accept_delay_ms: Arc<AtomicU32>,
     auto_accept_state: Arc<Mutex<String>>,
+    discord_webhook_url: Arc<Mutex<String>>,
     status: Arc<Mutex<PresenceStatus>>,
     startup_status: StartupStatus,
     connect_to_muc: Arc<AtomicBool>,
@@ -82,6 +83,7 @@ impl AppState {
         let auto_accept = Arc::new(AtomicBool::new(persistence::read_auto_accept()));
         let auto_accept_delay_ms =
             Arc::new(AtomicU32::new(persistence::read_auto_accept_delay_ms()));
+        let discord_webhook_url = Arc::new(Mutex::new(persistence::read_discord_webhook_url()));
         let auto_accept_state = Arc::new(Mutex::new(
             if auto_accept.load(Ordering::Relaxed) {
                 "Waiting for League Client"
@@ -95,6 +97,7 @@ impl AppState {
             auto_accept.clone(),
             auto_accept_delay_ms.clone(),
             auto_accept_state.clone(),
+            discord_webhook_url.clone(),
             logs.clone(),
         );
 
@@ -106,6 +109,7 @@ impl AppState {
             auto_accept,
             auto_accept_delay_ms,
             auto_accept_state,
+            discord_webhook_url,
             status: Arc::new(Mutex::new(session_status)),
             startup_status,
             connect_to_muc: Arc::new(AtomicBool::new(true)),
@@ -145,6 +149,11 @@ impl AppState {
                 .lock()
                 .map(|state| state.clone())
                 .unwrap_or_else(|_| "Unavailable".to_string()),
+            discord_webhook_url: self
+                .discord_webhook_url
+                .lock()
+                .map(|url| url.clone())
+                .unwrap_or_default(),
             status: status_value(&self.status),
             startup_status: self.startup_status,
             connect_to_muc: self.connect_to_muc.load(Ordering::Relaxed),
@@ -215,6 +224,8 @@ impl AppState {
         let enabled = self.enabled.clone();
         let safe_mode = self.safe_mode.clone();
         let helper_friend = self.helper_friend.clone();
+        let auto_accept = self.auto_accept.clone();
+        let auto_accept_state = self.auto_accept_state.clone();
         let connect_to_muc = self.connect_to_muc.clone();
         let runtime_running = running.clone();
         let runtime_riot_chat = riot_chat.clone();
@@ -311,6 +322,8 @@ impl AppState {
                     enabled,
                     safe_mode,
                     helper_friend,
+                    auto_accept,
+                    auto_accept_state,
                     status,
                     connect_to_muc,
                     health: runtime_health,
@@ -482,6 +495,16 @@ impl AppState {
         Ok(())
     }
 
+    pub fn set_discord_webhook_url(&mut self, url: String) -> Result<()> {
+        let url = url.trim().to_string();
+        persistence::write_discord_webhook_url(&url)?;
+        if let Ok(mut webhook_url) = self.discord_webhook_url.lock() {
+            *webhook_url = url;
+        }
+        self.push_log("Discord auto-accept webhook updated");
+        Ok(())
+    }
+
     pub fn set_connect_to_muc(&mut self, connect_to_muc: bool) {
         self.connect_to_muc.store(connect_to_muc, Ordering::Relaxed);
         self.push_log(if connect_to_muc {
@@ -551,6 +574,7 @@ fn start_auto_accept_monitor(
     enabled: Arc<AtomicBool>,
     delay_ms: Arc<AtomicU32>,
     state: Arc<Mutex<String>>,
+    discord_webhook_url: Arc<Mutex<String>>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
 ) {
     thread::spawn(move || {
@@ -599,6 +623,7 @@ fn start_auto_accept_monitor(
                                             LogLevel::Info,
                                             "Auto accepted ready check",
                                         );
+                                        notify_discord_auto_accept(&discord_webhook_url, &logs);
                                     }
                                     Ok(response) => {
                                         set_auto_accept_state(
@@ -645,6 +670,62 @@ fn start_auto_accept_monitor(
 }
 
 #[cfg(not(test))]
+fn notify_discord_auto_accept(
+    discord_webhook_url: &Arc<Mutex<String>>,
+    logs: &Arc<Mutex<Vec<LogEntry>>>,
+) {
+    let webhook_url = discord_webhook_url
+        .lock()
+        .map(|url| url.trim().to_string())
+        .unwrap_or_default();
+    if webhook_url.is_empty() {
+        return;
+    }
+
+    let ign = lcu_api::current_summoner_display_name().unwrap_or_else(|error| {
+        push_log_to(
+            logs,
+            LogCategory::System,
+            LogLevel::Warn,
+            format!("Unable to resolve summoner name for Discord webhook: {error:#}"),
+        );
+        "Ghosty".to_string()
+    });
+    let content = format!("{ign} has auto accepted a game");
+    match post_discord_webhook(&webhook_url, &content) {
+        Ok(()) => push_log_to(
+            logs,
+            LogCategory::System,
+            LogLevel::Info,
+            "Posted auto accept notification to Discord",
+        ),
+        Err(error) => push_log_to(
+            logs,
+            LogCategory::System,
+            LogLevel::Warn,
+            format!("Discord auto accept webhook failed: {error:#}"),
+        ),
+    }
+}
+
+#[cfg(not(test))]
+fn post_discord_webhook(webhook_url: &str, content: &str) -> Result<()> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .context("Unable to build Discord webhook client")?
+        .post(webhook_url)
+        .json(&serde_json::json!({ "content": content }))
+        .send()
+        .context("Unable to post Discord webhook")?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(anyhow!("Discord returned HTTP {}", response.status()))
+    }
+}
+
+#[cfg(not(test))]
 fn sleep_auto_accept_delay(enabled: &Arc<AtomicBool>, delay_ms: u32) {
     let mut remaining = delay_ms;
     while remaining > 0 && enabled.load(Ordering::Relaxed) {
@@ -681,6 +762,8 @@ struct ChatProxyContext {
     enabled: Arc<AtomicBool>,
     safe_mode: Arc<AtomicBool>,
     helper_friend: Arc<AtomicBool>,
+    auto_accept: Arc<AtomicBool>,
+    auto_accept_state: Arc<Mutex<String>>,
     status: Arc<Mutex<PresenceStatus>>,
     connect_to_muc: Arc<AtomicBool>,
     health: Arc<Mutex<ConnectionHealth>>,
@@ -886,10 +969,12 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                 match incoming_text_buffer.push(bytes) {
                     Utf8Chunk::Text { content, bytes } if helper_friend_enabled => {
                         saw_client_presence = content.contains("<presence");
-                        match helper_command_buffer.push(
+                        match helper_command_buffer.push_with_auto_accept(
                             &content,
                             &context.enabled,
                             &context.status,
+                            &context.auto_accept,
+                            &context.auto_accept_state,
                         )? {
                             HelperCommandResult::NotHelper => {
                                 forward_client_chat(
@@ -1195,7 +1280,12 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                     incoming.write_all(helper_presence.as_bytes())?;
                     let helper_message = presence::helper_chat_message(
                         &helper_jid,
-                        &helper_intro_message(&context.enabled, &context.status),
+                        &helper_intro_message(
+                            &context.enabled,
+                            &context.status,
+                            &context.auto_accept,
+                            &context.auto_accept_state,
+                        ),
                     );
                     log_stream_bytes(
                         &context.stream_tx,
@@ -1217,7 +1307,12 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                 {
                     let helper_message = presence::helper_chat_message(
                         &helper_jid,
-                        &helper_intro_message(&context.enabled, &context.status),
+                        &helper_intro_message(
+                            &context.enabled,
+                            &context.status,
+                            &context.auto_accept,
+                            &context.auto_accept_state,
+                        ),
                     );
                     log_stream_bytes(
                         &context.stream_tx,
@@ -1827,11 +1922,25 @@ impl HelperCommandBuffer {
         }
     }
 
+    #[cfg(test)]
     fn push(
         &mut self,
         content: &str,
         enabled: &Arc<AtomicBool>,
         status: &Arc<Mutex<PresenceStatus>>,
+    ) -> Result<HelperCommandResult> {
+        let auto_accept = Arc::new(AtomicBool::new(false));
+        let auto_accept_state = Arc::new(Mutex::new("Disabled".to_string()));
+        self.push_with_auto_accept(content, enabled, status, &auto_accept, &auto_accept_state)
+    }
+
+    fn push_with_auto_accept(
+        &mut self,
+        content: &str,
+        enabled: &Arc<AtomicBool>,
+        status: &Arc<Mutex<PresenceStatus>>,
+        auto_accept: &Arc<AtomicBool>,
+        auto_accept_state: &Arc<Mutex<String>>,
     ) -> Result<HelperCommandResult> {
         if self.pending.is_empty()
             && !presence::contains_helper_message(content, &self.helper_jid)
@@ -1841,9 +1950,14 @@ impl HelperCommandBuffer {
         }
 
         self.pending.push_str(content);
-        if let Some(intercept) =
-            helper_command_intercept_from_buffer(&self.pending, enabled, status, &self.helper_jid)?
-        {
+        if let Some(intercept) = helper_command_intercept_from_buffer(
+            &self.pending,
+            enabled,
+            status,
+            auto_accept,
+            auto_accept_state,
+            &self.helper_jid,
+        )? {
             self.pending.clear();
             return Ok(HelperCommandResult::Complete {
                 reply: intercept.reply,
@@ -2235,10 +2349,12 @@ fn helper_command_reply(
     enabled: &Arc<AtomicBool>,
     status: &Arc<Mutex<PresenceStatus>>,
 ) -> Result<Option<String>> {
+    let auto_accept = Arc::new(AtomicBool::new(false));
+    let auto_accept_state = Arc::new(Mutex::new("Disabled".to_string()));
     let Some(command) = helper_command_text(content) else {
         return Ok(None);
     };
-    helper_command_reply_for_text(&command, enabled, status)
+    helper_command_reply_for_text(&command, enabled, status, &auto_accept, &auto_accept_state)
 }
 
 struct HelperCommandIntercept {
@@ -2250,6 +2366,8 @@ fn helper_command_intercept_from_buffer(
     content: &str,
     enabled: &Arc<AtomicBool>,
     status: &Arc<Mutex<PresenceStatus>>,
+    auto_accept: &Arc<AtomicBool>,
+    auto_accept_state: &Arc<Mutex<String>>,
     helper_jid: &str,
 ) -> Result<Option<HelperCommandIntercept>> {
     let Some(extract) = helper_command_extract_to(content, helper_jid) else {
@@ -2258,7 +2376,9 @@ fn helper_command_intercept_from_buffer(
     let reply = extract
         .command
         .as_deref()
-        .map(|command| helper_command_reply_for_text(command, enabled, status))
+        .map(|command| {
+            helper_command_reply_for_text(command, enabled, status, auto_accept, auto_accept_state)
+        })
         .transpose()?
         .flatten();
     Ok(Some(HelperCommandIntercept {
@@ -2271,6 +2391,8 @@ fn helper_command_reply_for_text(
     command: &str,
     enabled: &Arc<AtomicBool>,
     status: &Arc<Mutex<PresenceStatus>>,
+    auto_accept: &Arc<AtomicBool>,
+    auto_accept_state: &Arc<Mutex<String>>,
 ) -> Result<Option<String>> {
     let Some(command) = helper_command_kind(command) else {
         return Ok(None);
@@ -2291,25 +2413,87 @@ fn helper_command_reply_for_text(
     } else if command == "disable" {
         enabled.store(false, Ordering::Relaxed);
         Ok(Some("Ghosty is now disabled.".to_string()))
+    } else if command == "auto_accept_on" {
+        persistence::write_auto_accept(true)?;
+        auto_accept.store(true, Ordering::Relaxed);
+        set_auto_accept_state(auto_accept_state, "Watching for ready check");
+        Ok(Some("Auto accept is now enabled.".to_string()))
+    } else if command == "auto_accept_off" {
+        persistence::write_auto_accept(false)?;
+        auto_accept.store(false, Ordering::Relaxed);
+        set_auto_accept_state(auto_accept_state, "Disabled");
+        Ok(Some("Auto accept is now disabled.".to_string()))
+    } else if command == "auto_accept_status" {
+        Ok(Some(helper_auto_accept_message(
+            auto_accept,
+            auto_accept_state,
+        )?))
+    } else if command == "opgg" {
+        Ok(Some(current_user_opgg_link()?))
+    } else if command == "opgg_multi" {
+        Ok(Some(current_lobby_opgg_multisearch_link()?))
+    } else if command == "friends_summary" {
+        Ok(Some(current_friends_summary()?))
     } else if command == "status" {
-        Ok(Some(helper_status_message(enabled, status)?))
+        Ok(Some(helper_status_message(
+            enabled,
+            status,
+            auto_accept,
+            auto_accept_state,
+        )?))
     } else if command == "help" {
-        Ok(Some(
-            "Send online, offline, mobile, enable, disable, or status.".to_string(),
-        ))
+        Ok(Some(helper_command_help_message().to_string()))
     } else {
         Ok(None)
     }
 }
 
 fn helper_command_kind(command: &str) -> Option<&'static str> {
+    let command = command.to_ascii_lowercase();
+    if contains_command_phrase(&command, &["auto", "accept"]) {
+        if contains_command_word(&command, "off") || contains_command_word(&command, "disable") {
+            return Some("auto_accept_off");
+        }
+        if contains_command_word(&command, "status") {
+            return Some("auto_accept_status");
+        }
+        return Some("auto_accept_on");
+    }
+    if contains_command_word(&command, "friend") || contains_command_word(&command, "friends") {
+        return Some("friends_summary");
+    }
+    if contains_command_word(&command, "multi")
+        || contains_command_phrase(&command, &["lobby", "link"])
+        || contains_command_phrase(&command, &["lobby", "opgg"])
+        || contains_command_phrase(&command, &["lobby", "op", "gg"])
+    {
+        return Some("opgg_multi");
+    }
+    if contains_command_word(&command, "opgg")
+        || contains_command_word(&command, "op")
+        || contains_command_phrase(&command, &["op", "gg"])
+    {
+        return Some("opgg");
+    }
+
     const COMMANDS: [&str; 7] = [
         "offline", "mobile", "online", "disable", "enable", "status", "help",
     ];
-    let command = command.to_ascii_lowercase();
     COMMANDS
         .into_iter()
         .find(|keyword| contains_command_word(&command, keyword))
+}
+
+fn contains_command_phrase(command: &str, words: &[&str]) -> bool {
+    let command_words = command
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words.iter().all(|word| {
+        command_words
+            .iter()
+            .any(|command_word| command_word == word)
+    })
 }
 
 fn contains_command_word(command: &str, keyword: &str) -> bool {
@@ -2318,15 +2502,21 @@ fn contains_command_word(command: &str, keyword: &str) -> bool {
         .any(|word| word == keyword)
 }
 
-fn helper_intro_message(enabled: &Arc<AtomicBool>, status: &Arc<Mutex<PresenceStatus>>) -> String {
-    helper_status_message(enabled, status).unwrap_or_else(|_| {
-        "Ghosty is running. Send online, offline, mobile, enable, disable, or status.".to_string()
-    })
+fn helper_intro_message(
+    enabled: &Arc<AtomicBool>,
+    status: &Arc<Mutex<PresenceStatus>>,
+    auto_accept: &Arc<AtomicBool>,
+    auto_accept_state: &Arc<Mutex<String>>,
+) -> String {
+    helper_status_message(enabled, status, auto_accept, auto_accept_state)
+        .unwrap_or_else(|_| format!("Ghosty is running. {}", helper_command_help_message()))
 }
 
 fn helper_status_message(
     enabled: &Arc<AtomicBool>,
     status: &Arc<Mutex<PresenceStatus>>,
+    auto_accept: &Arc<AtomicBool>,
+    auto_accept_state: &Arc<Mutex<String>>,
 ) -> Result<String> {
     let status = status
         .lock()
@@ -2337,9 +2527,64 @@ fn helper_status_message(
     } else {
         "disabled"
     };
+    let auto_accept = helper_auto_accept_message(auto_accept, auto_accept_state)?;
     Ok(format!(
-        "You are appearing {status}. Presence masking is {masking}. Send online, offline, mobile, enable, disable, or status."
+        "You are appearing {status}. Presence masking is {masking}. {auto_accept} {}",
+        helper_command_help_message()
     ))
+}
+
+fn helper_command_help_message() -> &'static str {
+    "Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
+}
+
+fn helper_auto_accept_message(
+    auto_accept: &Arc<AtomicBool>,
+    auto_accept_state: &Arc<Mutex<String>>,
+) -> Result<String> {
+    let enabled = if auto_accept.load(Ordering::Relaxed) {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let state = auto_accept_state
+        .lock()
+        .map_err(|e| anyhow!(e.to_string()))?
+        .clone();
+    Ok(format!("Auto accept is {enabled}. Client state: {state}."))
+}
+
+#[cfg(not(test))]
+fn current_user_opgg_link() -> Result<String> {
+    lcu_api::current_summoner_opgg_link()
+}
+
+#[cfg(not(test))]
+fn current_lobby_opgg_multisearch_link() -> Result<String> {
+    lcu_api::current_lobby_opgg_multisearch_link()
+}
+
+#[cfg(not(test))]
+fn current_friends_summary() -> Result<String> {
+    lcu_api::current_friends_summary()
+}
+
+#[cfg(test)]
+fn current_user_opgg_link() -> Result<String> {
+    Ok("https://www.op.gg/summoners/na/Ghosty-NA1".to_string())
+}
+
+#[cfg(test)]
+fn current_lobby_opgg_multisearch_link() -> Result<String> {
+    Ok("https://op.gg/lol/multisearch/na?summoners=Ghosty%23NA1%2CDuo%23NA2".to_string())
+}
+
+#[cfg(test)]
+fn current_friends_summary() -> Result<String> {
+    Ok(
+        "Friends: 3 total. Statuses: online 1, mobile 1, offline 1. Products: League 1, Riot Mobile 1, Unknown 1."
+            .to_string(),
+    )
 }
 
 fn helper_status_label(status: PresenceStatus) -> &'static str {
@@ -2878,6 +3123,7 @@ mod tests {
             auto_accept: Arc::new(AtomicBool::new(false)),
             auto_accept_delay_ms: Arc::new(AtomicU32::new(2_000)),
             auto_accept_state: Arc::new(Mutex::new("Disabled".to_string())),
+            discord_webhook_url: Arc::new(Mutex::new(String::new())),
             status: Arc::new(Mutex::new(PresenceStatus::Offline)),
             startup_status: StartupStatus::Last,
             connect_to_muc: Arc::new(AtomicBool::new(true)),
@@ -3132,7 +3378,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing online. Presence masking is enabled. Send online, offline, mobile, enable, disable, or status."
+            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
         );
         assert_eq!(
             *status.lock().expect("status poisoned"),
@@ -3152,7 +3398,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing offline. Presence masking is disabled. Send online, offline, mobile, enable, disable, or status."
+            "You are appearing offline. Presence masking is disabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
         );
     }
 
@@ -3160,12 +3406,14 @@ mod tests {
     fn helper_intro_message_reports_current_status() {
         let enabled = Arc::new(AtomicBool::new(true));
         let status = Arc::new(Mutex::new(PresenceStatus::Mobile));
+        let auto_accept = Arc::new(AtomicBool::new(false));
+        let auto_accept_state = Arc::new(Mutex::new("Disabled".to_string()));
 
-        let message = helper_intro_message(&enabled, &status);
+        let message = helper_intro_message(&enabled, &status, &auto_accept, &auto_accept_state);
 
         assert_eq!(
             message,
-            "You are appearing mobile. Presence masking is enabled. Send online, offline, mobile, enable, disable, or status."
+            "You are appearing mobile. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
         );
     }
 
@@ -3219,11 +3467,31 @@ mod tests {
             ("disable", "Ghosty is now disabled."),
             (
                 "status",
-                "You are appearing mobile. Presence masking is disabled. Send online, offline, mobile, enable, disable, or status.",
+                "You are appearing mobile. Presence masking is disabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi.",
             ),
             (
                 "help",
-                "Send online, offline, mobile, enable, disable, or status.",
+                "Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi.",
+            ),
+            ("auto accept", "Auto accept is now enabled."),
+            ("auto accept on", "Auto accept is now enabled."),
+            ("turn on auto accept", "Auto accept is now enabled."),
+            ("auto accept off", "Auto accept is now disabled."),
+            (
+                "auto accept status",
+                "Auto accept is disabled. Client state: Disabled.",
+            ),
+            (
+                "op.gg",
+                "https://www.op.gg/summoners/na/Ghosty-NA1",
+            ),
+            (
+                "op.gg multi",
+                "https://op.gg/lol/multisearch/na?summoners=Ghosty%23NA1%2CDuo%23NA2",
+            ),
+            (
+                "friends status",
+                "Friends: 3 total. Statuses: online 1, mobile 1, offline 1. Products: League 1, Riot Mobile 1, Unknown 1.",
             ),
         ];
 
@@ -3286,7 +3554,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing online. Presence masking is enabled. Send online, offline, mobile, enable, disable, or status."
+            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
         );
     }
 
@@ -3618,7 +3886,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing online. Presence masking is enabled. Send online, offline, mobile, enable, disable, or status."
+            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
         );
         assert!(passthrough.contains("</presence>"));
         assert!(passthrough.contains('\n'));

@@ -2,6 +2,12 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
+  import { Badge } from "$lib/components/ui/badge";
+  import { Button } from "$lib/components/ui/button";
+  import { Input } from "$lib/components/ui/input";
+  import { Kbd } from "$lib/components/ui/kbd";
+  import { ScrollArea } from "$lib/components/ui/scroll-area";
+  import { Spinner } from "$lib/components/ui/spinner";
   import {
     Activity,
     Clipboard,
@@ -84,6 +90,7 @@
     autoAccept: boolean;
     autoAcceptDelayMs: number;
     autoAcceptState: string;
+    discordWebhookUrl: string;
     status: PresenceStatus;
     startupStatus: StartupStatus;
     connectToMuc: boolean;
@@ -144,6 +151,7 @@
     autoAccept: false,
     autoAcceptDelayMs: 2000,
     autoAcceptState: "Disabled",
+    discordWebhookUrl: "",
     status: "offline",
     startupStatus: "last",
     connectToMuc: true,
@@ -356,6 +364,10 @@
 
   async function setAutoAcceptDelayMs(delayMs: number) {
     await updateSnapshot(() => invoke<AppSnapshot>("set_auto_accept_delay_ms", { delayMs }));
+  }
+
+  async function setDiscordWebhookUrl(url: string) {
+    await updateSnapshot(() => invoke<AppSnapshot>("set_discord_webhook_url", { url }));
   }
 
   async function setConnectToMuc(connectToMuc: boolean) {
@@ -642,30 +654,30 @@
       <strong data-tauri-drag-region>Ghosty</strong>
     </div>
     <div class="title-status" data-tauri-drag-region>
-      <span class:online={snapshot.running} class="title-status-chip" data-tauri-drag-region>
+      <Badge class={`title-status-chip ${snapshot.running ? "online" : ""}`} variant="outline" data-tauri-drag-region>
         <Activity size={12} />
         Proxy; {snapshot.running ? "Running" : "Stopped"}
-      </span>
-      <span class="title-status-chip presence" data-status={snapshot.status} data-tauri-drag-region>
+      </Badge>
+      <Badge class="title-status-chip presence" variant="outline" data-status={snapshot.status} data-tauri-drag-region>
         <Shield size={12} />
         League; {presenceLabel(snapshot.status)}
-      </span>
-      <span class="title-status-chip client-state" data-tauri-drag-region>
+      </Badge>
+      <Badge class="title-status-chip client-state" variant="outline" data-tauri-drag-region>
         <ListChecks size={12} />
         Client State; {leagueClientStateLabel()}
-      </span>
+      </Badge>
     </div>
   </div>
   <div class="window-controls">
-    <button class="window-button" type="button" title="Minimize" onclick={minimizeWindow}>
+    <Button class="window-button" variant="ghost" size="icon-sm" title="Minimize" onclick={minimizeWindow}>
       <Minus size={15} />
-    </button>
-    <button class="window-button" type="button" title="Maximize" onclick={toggleMaximizeWindow}>
+    </Button>
+    <Button class="window-button" variant="ghost" size="icon-sm" title="Maximize" onclick={toggleMaximizeWindow}>
       <Maximize2 size={14} />
-    </button>
-    <button class="window-button close" type="button" title="Close" onclick={closeWindow}>
+    </Button>
+    <Button class="window-button close" variant="ghost" size="icon-sm" title="Close" onclick={closeWindow}>
       <X size={16} />
-    </button>
+    </Button>
   </div>
 </div>
 
@@ -676,14 +688,14 @@
       <p>Riot presence masking for League, VALORANT, Runeterra, and 2XKO.</p>
     </div>
     <div class="header-status">
-      <div class:online={snapshot.running} class="state-pill">
+      <Badge class={`state-pill ${snapshot.running ? "online" : ""}`} variant="outline">
         <Activity size={16} />
         Proxy; {snapshot.running ? "Running" : "Stopped"}
-      </div>
-      <div class="state-pill client">
+      </Badge>
+      <Badge class="state-pill client" variant="outline">
         <ListChecks size={16} />
         Client State; {leagueClientStateLabel()}
-      </div>
+      </Badge>
     </div>
   </header>
 
@@ -720,28 +732,28 @@
           </div>
         </div>
         <div class="dialog-footer">
-          <button disabled={busy} type="button" onclick={cancelRiotRestart}>Cancel</button>
-          <button class="danger" disabled={busy} type="button" onclick={() => runAction(confirmRiotRestart)}>
+          <Button disabled={busy} variant="outline" onclick={cancelRiotRestart}>Cancel</Button>
+          <Button class="danger" disabled={busy} variant="destructive" onclick={() => runAction(confirmRiotRestart)}>
             <Trash2 size={16} /> Stop Riot and Start
-          </button>
+          </Button>
         </div>
       </div>
     </div>
   {/if}
 
   <nav class="tabs" aria-label="Ghosty sections">
-    <a class:active={activeTab === "launch"} href="/">
+    <Button class={activeTab === "launch" ? "active" : ""} href="/" variant="ghost" size="sm">
       <Gamepad2 size={16} /> Launch
-    </a>
-    <a class:active={activeTab === "presence"} href="/presence">
+    </Button>
+    <Button class={activeTab === "presence" ? "active" : ""} href="/presence" variant="ghost" size="sm">
       <Shield size={16} /> Presence
-    </a>
-    <a class:active={activeTab === "utility"} href="/utility">
+    </Button>
+    <Button class={activeTab === "utility" ? "active" : ""} href="/utility" variant="ghost" size="sm">
       <ListChecks size={16} /> Utility
-    </a>
-    <a class:active={activeTab === "debug"} href="/debug">
+    </Button>
+    <Button class={activeTab === "debug" ? "active" : ""} href="/debug" variant="ghost" size="sm">
       <HeartPulse size={16} /> Debug
-    </a>
+    </Button>
   </nav>
 
   {#if activeTab === "debug"}
@@ -773,9 +785,9 @@
         <ListChecks size={18} />
         <h2>Preflight</h2>
       </div>
-      <button class="wide-action" disabled={busy} type="button" onclick={() => runAction(runPreflight)}>
-        Run Checks
-      </button>
+      <Button class="wide-action" disabled={busy} variant="outline" onclick={() => runAction(runPreflight)}>
+        {#if busy}<Spinner />{/if} Run Checks
+      </Button>
       {#if preflightReport}
         <div class="checks" class:ok={preflightReport.ok}>
           {#each preflightReport.checks as check}
@@ -794,9 +806,9 @@
         <h2>Quick Actions</h2>
       </div>
       <div class="hotkeys">
-        <span>Ctrl+Alt+O Offline</span>
-        <span>Ctrl+Alt+M Mobile</span>
-        <span>Ctrl+Alt+N Online</span>
+        <span><Kbd>Ctrl</Kbd><Kbd>Alt</Kbd><Kbd>O</Kbd> Offline</span>
+        <span><Kbd>Ctrl</Kbd><Kbd>Alt</Kbd><Kbd>M</Kbd> Mobile</span>
+        <span><Kbd>Ctrl</Kbd><Kbd>Alt</Kbd><Kbd>N</Kbd> Online</span>
       </div>
       <p class="fine-print">Tray menu includes show, status changes, masking toggle, and quit.</p>
     </div>
@@ -813,16 +825,16 @@
 
       <div class="game-grid">
         {#each games as game}
-          <button class:selected={selectedGame === game.id} class="game-tile" type="button" onclick={() => selectGame(game.id)}>
+          <Button class={`game-tile ${selectedGame === game.id ? "selected" : ""}`} variant="outline" onclick={() => selectGame(game.id)}>
             <strong>{game.label}</strong>
             <span>{game.hint}</span>
-          </button>
+          </Button>
         {/each}
       </div>
 
       <label class="field">
         <span>Patchline</span>
-        <input aria-invalid={patchlineError ? "true" : "false"} value={gamePatchline} oninput={(event) => updateGamePatchline(event.currentTarget.value)} />
+        <Input aria-invalid={patchlineError ? "true" : "false"} value={gamePatchline} oninput={(event) => updateGamePatchline(event.currentTarget.value)} />
         {#if patchlineError}
           <small class="field-error">{patchlineError}</small>
         {/if}
@@ -830,12 +842,12 @@
 
       <label class="field">
         <span>Riot Client Params</span>
-        <input value={riotClientParams} oninput={(event) => updateRiotClientParams(event.currentTarget.value)} placeholder="--allow-multiple-clients" />
+        <Input value={riotClientParams} oninput={(event) => updateRiotClientParams(event.currentTarget.value)} placeholder="--allow-multiple-clients" />
       </label>
 
       <label class="field">
         <span>Game Params</span>
-        <input value={gameParams} oninput={(event) => updateGameParams(event.currentTarget.value)} placeholder="optional arguments after --" />
+        <Input value={gameParams} oninput={(event) => updateGameParams(event.currentTarget.value)} placeholder="optional arguments after --" />
       </label>
 
       <label class="switch">
@@ -845,23 +857,23 @@
 
       <div class="button-row">
         {#if snapshot.running}
-          <button class="primary danger" disabled={busy} type="button" onclick={() => runAction(stop)}>
+          <Button class="primary danger" disabled={busy} variant="destructive" onclick={() => runAction(stop)}>
             <Square size={17} /> Stop
-          </button>
+          </Button>
         {:else}
-          <button class="primary" disabled={launchBlocked} type="button" onclick={() => runAction(start)}>
-            <Power size={17} /> Start
-          </button>
+          <Button class="primary" disabled={launchBlocked} onclick={() => runAction(start)}>
+            {#if busy}<Spinner />{:else}<Power size={17} />{/if} Start
+          </Button>
         {/if}
-        <button disabled={busy} type="button" onclick={() => runAction(locate)} title="Locate Riot Client">
+        <Button disabled={busy} variant="outline" onclick={() => runAction(locate)} title="Locate Riot Client">
           <Search size={17} /> Locate
-        </button>
-        <button disabled={busy} type="button" onclick={() => runAction(killRiot)} title="Stop Riot processes">
+        </Button>
+        <Button disabled={busy} variant="outline" onclick={() => runAction(killRiot)} title="Stop Riot processes">
           <Trash2 size={17} /> Kill Riot
-        </button>
-        <button disabled={launchBlocked} type="button" onclick={() => runAction(cleanRestart)} title="Stop Riot, restart proxy, launch selected game">
+        </Button>
+        <Button disabled={launchBlocked} variant="outline" onclick={() => runAction(cleanRestart)} title="Stop Riot, restart proxy, launch selected game">
           <RefreshCcw size={17} /> Clean Restart
-        </button>
+        </Button>
       </div>
     </div>
     {/if}
@@ -875,9 +887,9 @@
 
       <div class="segmented">
         {#each statuses as status}
-          <button class:active={snapshot.status === status.id} disabled={busy} type="button" onclick={() => runAction(() => setStatus(status.id))}>
+          <Button class={snapshot.status === status.id ? "active" : ""} disabled={busy} variant="outline" onclick={() => runAction(() => setStatus(status.id))}>
             {status.label}
-          </button>
+          </Button>
         {/each}
       </div>
 
@@ -904,9 +916,9 @@
       <div class="subhead">Startup Status</div>
       <div class="startup-grid">
         {#each startupStatuses as startup}
-          <button class:active={snapshot.startupStatus === startup.id} disabled={busy} type="button" onclick={() => runAction(() => setStartupStatus(startup.id))}>
+          <Button class={snapshot.startupStatus === startup.id ? "active" : ""} disabled={busy} variant="outline" onclick={() => runAction(() => setStartupStatus(startup.id))}>
             {startup.label}
-          </button>
+          </Button>
         {/each}
       </div>
     </div>
@@ -941,7 +953,7 @@
         />
         <label class="compact-field">
           <span>Milliseconds</span>
-          <input
+          <Input
             disabled={busy}
             max="10000"
             min="0"
@@ -953,6 +965,17 @@
         </label>
         <div class="setting-status">{snapshot.autoAcceptState}</div>
       </div>
+
+      <label class="field">
+        <span>Discord Webhook</span>
+        <Input
+          disabled={busy}
+          placeholder="https://discord.com/api/webhooks/..."
+          type="url"
+          value={snapshot.discordWebhookUrl}
+          onchange={(event) => runAction(() => setDiscordWebhookUrl(event.currentTarget.value))}
+        />
+      </label>
     </div>
     {/if}
 
@@ -1005,7 +1028,7 @@
       </label>
       <label class="field">
         <span>Path</span>
-        <input value={lcuEndpoint} oninput={(event) => (lcuEndpoint = event.currentTarget.value)} placeholder="/lol-summoner/v1/current-summoner" />
+        <Input value={lcuEndpoint} oninput={(event) => (lcuEndpoint = event.currentTarget.value)} placeholder="/lol-summoner/v1/current-summoner" />
       </label>
       {#if lcuMethod !== "GET" && lcuMethod !== "DELETE"}
         <label class="field">
@@ -1014,14 +1037,14 @@
         </label>
       {/if}
       <div class="button-row">
-        <button class="primary" disabled={busy} type="button" onclick={() => runAction(callLcuApi)}>
-          <Search size={17} /> Call Endpoint
-        </button>
+        <Button class="primary" disabled={busy} onclick={() => runAction(callLcuApi)}>
+          {#if busy}<Spinner />{:else}<Search size={17} />{/if} Call Endpoint
+        </Button>
       </div>
       {#if lcuResponse}
         <div class="api-result">
           <div class="api-result-meta">
-            <span class:ok={lcuResponse.ok}>{lcuResponse.status}</span>
+            <Badge class={lcuResponse.ok ? "ok" : ""} variant="outline">{lcuResponse.status}</Badge>
             <strong>{lcuResponse.method} {lcuResponse.endpoint}</strong>
           </div>
           <pre>{lcuResponseText()}</pre>
@@ -1033,18 +1056,18 @@
       <div class="panel-title">
         <MessageSquare size={18} />
         <h2>Log</h2>
-        <button class="icon-action" disabled={busy} type="button" title="Copy logs" onclick={() => runAction(copyLogs)}>
+        <Button class="icon-action" disabled={busy} variant="ghost" size="icon-sm" title="Copy logs" onclick={() => runAction(copyLogs)}>
           <Clipboard size={16} />
-        </button>
+        </Button>
       </div>
       <div class="log-filters">
         {#each ["all", "config", "chat", "launch", "error", "system"] as filter}
-          <button class:active={logFilter === filter} type="button" onclick={() => (logFilter = filter as "all" | LogCategory)}>
+          <Button class={logFilter === filter ? "active" : ""} variant="outline" size="sm" onclick={() => (logFilter = filter as "all" | LogCategory)}>
             {filter}
-          </button>
+          </Button>
         {/each}
       </div>
-      <div class="log">
+      <ScrollArea class="log">
         {#if filteredLogs().length}
           {#each filteredLogs() as line}
             <p data-category={line.category} data-level={line.level}>
@@ -1056,7 +1079,7 @@
         {:else}
           <p>No proxy events yet.</p>
         {/if}
-      </div>
+      </ScrollArea>
     </div>
 
     <div class="panel log-panel event-stream-panel">
@@ -1067,11 +1090,11 @@
           <input type="checkbox" checked={streamAutoScroll} onchange={toggleStreamAutoScroll} />
           <span>Auto Scroll</span>
         </label>
-        <button class="icon-action" disabled={busy} type="button" title="Copy event stream" onclick={() => runAction(copyStreamEvents)}>
+        <Button class="icon-action" disabled={busy} variant="ghost" size="icon-sm" title="Copy event stream" onclick={() => runAction(copyStreamEvents)}>
           <Clipboard size={16} />
-        </button>
+        </Button>
       </div>
-      <div class="log stream-log" bind:this={streamLogElement}>
+      <ScrollArea class="log stream-log" bind:viewportRef={streamLogElement}>
         {#if streamEvents().length}
           {#each streamEvents() as event}
             <p>
@@ -1084,1045 +1107,9 @@
         {:else}
           <p>No stream events yet.</p>
         {/if}
-      </div>
+      </ScrollArea>
     </div>
     {/if}
   </section>
 </main>
 
-<style>
-  :global(*) {
-    box-sizing: border-box;
-  }
-
-  :global(body) {
-    margin: 0;
-    min-width: 360px;
-    min-height: 100vh;
-    color: #1c2430;
-    background: #f2f5f7;
-    scrollbar-color: #93a2b1 #e2e7ec;
-    scrollbar-width: thin;
-    font-family:
-      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  }
-
-  :global(::-webkit-scrollbar) {
-    width: 12px;
-    height: 12px;
-  }
-
-  :global(::-webkit-scrollbar-track) {
-    background: #e2e7ec;
-  }
-
-  :global(::-webkit-scrollbar-thumb) {
-    min-height: 42px;
-    border: 3px solid #e2e7ec;
-    border-radius: 999px;
-    background: #93a2b1;
-  }
-
-  :global(::-webkit-scrollbar-thumb:hover) {
-    background: #6f7f90;
-  }
-
-  :global(::-webkit-scrollbar-corner) {
-    background: #e2e7ec;
-  }
-
-  button,
-  input {
-    font: inherit;
-  }
-
-  .titlebar {
-    position: fixed;
-    z-index: 20;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 44px;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    border-bottom: 1px solid #d7dde3;
-    background: rgba(255, 255, 255, 0.96);
-    user-select: none;
-  }
-
-  .drag-region {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 0;
-    padding: 0 12px;
-  }
-
-  .brand-mark {
-    width: 24px;
-    height: 24px;
-    border-radius: 7px;
-    object-fit: cover;
-  }
-
-  .title-copy {
-    display: flex;
-    align-items: baseline;
-    gap: 9px;
-    min-width: 0;
-  }
-
-  .title-copy strong {
-    color: #172232;
-    font-size: 13px;
-    letter-spacing: 0;
-  }
-
-  .title-status {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-    margin-left: auto;
-  }
-
-  .title-status-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    min-width: 0;
-    min-height: 24px;
-    padding: 0 8px;
-    border: 1px solid #d2dae3;
-    border-radius: 7px;
-    background: #f7fafc;
-    color: #7a2e38;
-    font-size: 12px;
-    font-weight: 800;
-    line-height: 1;
-    white-space: nowrap;
-  }
-
-  .title-status-chip.online,
-  .title-status-chip[data-status="chat"] {
-    border-color: #9fd0b7;
-    background: #effaf4;
-    color: #14633f;
-  }
-
-  .title-status-chip[data-status="mobile"] {
-    border-color: #9fbfe0;
-    background: #eef6ff;
-    color: #255f99;
-  }
-
-  .title-status-chip.client-state {
-    max-width: 210px;
-    color: #31526f;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .window-controls {
-    display: flex;
-    align-items: stretch;
-  }
-
-  .window-button {
-    display: grid;
-    place-items: center;
-    width: 44px;
-    min-height: 0;
-    height: 44px;
-    padding: 0;
-    border: 0;
-    border-radius: 0;
-    background: transparent;
-    color: #344252;
-  }
-
-  .window-button:hover {
-    background: #e8eef4;
-  }
-
-  .window-button.close:hover {
-    background: #c73744;
-    color: #fff;
-  }
-
-  .shell {
-    width: min(1120px, calc(100vw - 32px));
-    margin: 0 auto;
-    padding: 68px 0 24px;
-  }
-
-  header {
-    display: flex;
-    align-items: end;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 18px;
-  }
-
-  h1,
-  h2,
-  p {
-    margin: 0;
-  }
-
-  h1 {
-    font-size: 30px;
-    line-height: 1.1;
-    letter-spacing: 0;
-  }
-
-  header p {
-    margin-top: 5px;
-    color: #5c6875;
-  }
-
-  .header-status {
-    display: flex;
-    align-items: center;
-    justify-content: end;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .state-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 34px;
-    padding: 0 12px;
-    border: 1px solid #c9d1da;
-    border-radius: 8px;
-    background: #fff;
-    color: #6b2630;
-    font-weight: 700;
-    white-space: nowrap;
-  }
-
-  .state-pill.online {
-    color: #14633f;
-    border-color: #9fd0b7;
-  }
-
-  .state-pill.client {
-    max-width: 320px;
-    color: #31526f;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .error {
-    margin-bottom: 14px;
-    padding: 10px 12px;
-    border: 1px solid #e1a4a4;
-    border-radius: 8px;
-    background: #fff3f3;
-    color: #8b1e1e;
-  }
-
-  .notice {
-    margin-bottom: 14px;
-    padding: 10px 12px;
-    border: 1px solid #9fd0b7;
-    border-radius: 8px;
-    background: #effaf4;
-    color: #14633f;
-  }
-
-  .dialog-overlay {
-    position: fixed;
-    z-index: 40;
-    inset: 0;
-    display: grid;
-    place-items: center;
-    padding: 18px;
-    background: rgba(14, 23, 33, 0.46);
-  }
-
-  .dialog-content {
-    width: min(460px, 100%);
-    display: grid;
-    gap: 18px;
-    border: 1px solid #d6dde5;
-    border-radius: 8px;
-    background: #fff;
-    padding: 20px;
-    box-shadow: 0 22px 70px rgba(12, 24, 36, 0.24);
-  }
-
-  .dialog-header {
-    display: grid;
-    grid-template-columns: 42px minmax(0, 1fr);
-    gap: 12px;
-    align-items: start;
-  }
-
-  .dialog-icon {
-    display: grid;
-    place-items: center;
-    width: 42px;
-    height: 42px;
-    border: 1px solid #f0c2c7;
-    border-radius: 8px;
-    background: #fff2f3;
-    color: #a52835;
-  }
-
-  .dialog-header h2 {
-    color: #172232;
-    font-size: 18px;
-    line-height: 1.25;
-  }
-
-  .dialog-header p,
-  .dialog-body p {
-    color: #5c6875;
-    font-size: 13px;
-    line-height: 1.45;
-  }
-
-  .dialog-body {
-    display: grid;
-    gap: 10px;
-  }
-
-  .process-list {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 7px;
-  }
-
-  .process-list span {
-    padding: 5px 8px;
-    border: 1px solid #d6dde5;
-    border-radius: 7px;
-    background: #f4f7fa;
-    color: #344252;
-    font-size: 12px;
-    font-weight: 800;
-  }
-
-  .dialog-footer {
-    display: flex;
-    justify-content: end;
-    gap: 8px;
-  }
-
-  .dialog-footer button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-    min-height: 34px;
-    padding: 0 12px;
-    border: 1px solid #c9d1da;
-    border-radius: 7px;
-    background: #fff;
-    color: #263342;
-    font-weight: 800;
-  }
-
-  .dialog-footer button:hover:not(:disabled) {
-    background: #f4f7fa;
-  }
-
-  .dialog-footer button.danger {
-    border-color: #a52835;
-    background: #a52835;
-    color: #fff;
-  }
-
-  .dialog-footer button.danger:hover:not(:disabled) {
-    background: #8e202c;
-  }
-
-  .tabs {
-    display: inline-grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 6px;
-    margin-bottom: 14px;
-    padding: 5px;
-    border: 1px solid #d7dde3;
-    border-radius: 8px;
-    background: #fff;
-  }
-
-  .tabs a {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-    min-width: 128px;
-    min-height: 34px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    border-color: transparent;
-    background: transparent;
-    color: #263442;
-    padding: 0 12px;
-    font-weight: 700;
-    text-decoration: none;
-  }
-
-  .tabs a.active {
-    border-color: #2364aa;
-    background: #e8f1fb;
-    color: #123d6d;
-  }
-
-  .grid {
-    display: grid;
-    grid-template-columns: minmax(360px, 1.25fr) minmax(300px, 0.9fr);
-    gap: 14px;
-  }
-
-  .grid.single {
-    grid-template-columns: minmax(360px, 760px);
-  }
-
-  .status-grid {
-    display: grid;
-    grid-template-columns: minmax(360px, 1.4fr) minmax(260px, 0.9fr) minmax(230px, 0.75fr);
-    gap: 14px;
-    margin-bottom: 14px;
-  }
-
-  .panel {
-    border: 1px solid #d7dde3;
-    border-radius: 8px;
-    background: #fff;
-    padding: 16px;
-    box-shadow: 0 1px 2px rgba(25, 35, 45, 0.06);
-  }
-
-  .launch-panel,
-  .log-panel {
-    grid-row: span 2;
-  }
-
-  .panel-title {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 14px;
-  }
-
-  .panel-title.compact {
-    margin-bottom: 10px;
-  }
-
-  .panel-title .icon-action {
-    margin-left: auto;
-  }
-
-  .auto-scroll-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 28px;
-    margin-left: auto;
-    padding: 0 8px;
-    border: 1px solid #d6dde5;
-    border-radius: 7px;
-    background: #f7fafc;
-    color: #405060;
-    font-size: 12px;
-    font-weight: 800;
-    white-space: nowrap;
-  }
-
-  .auto-scroll-toggle input {
-    width: 14px;
-    height: 14px;
-    accent-color: #2364aa;
-  }
-
-  .auto-scroll-toggle + .icon-action {
-    margin-left: 0;
-  }
-
-  h2 {
-    font-size: 17px;
-    line-height: 1.2;
-  }
-
-  .game-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-    margin-bottom: 14px;
-  }
-
-  .game-tile {
-    height: 64px;
-    text-align: left;
-    border: 1px solid #d6dde5;
-    border-radius: 8px;
-    background: #f8fafb;
-    color: #1b2430;
-    padding: 9px 10px;
-    cursor: pointer;
-  }
-
-  .game-tile strong,
-  .game-tile span {
-    display: block;
-  }
-
-  .game-tile span {
-    margin-top: 3px;
-    color: #697686;
-    font-size: 12px;
-  }
-
-  .game-tile.selected,
-  .segmented button.active,
-  .startup-grid button.active {
-    border-color: #2364aa;
-    background: #e8f1fb;
-    color: #123d6d;
-  }
-
-  .field {
-    display: grid;
-    gap: 6px;
-    margin-top: 10px;
-    color: #4b5968;
-    font-size: 13px;
-    font-weight: 700;
-  }
-
-  .field input,
-  .field select,
-  .field textarea {
-    width: 100%;
-    min-height: 38px;
-    border: 1px solid #ccd4dd;
-    border-radius: 7px;
-    background: #fff;
-    color: #1c2430;
-    padding: 0 10px;
-  }
-
-  .field textarea {
-    min-height: 88px;
-    padding: 9px 10px;
-    resize: vertical;
-    font-family: "Cascadia Mono", Consolas, monospace;
-    font-size: 12px;
-    line-height: 1.45;
-  }
-
-  .field select {
-    appearance: none;
-    background:
-      linear-gradient(45deg, transparent 50%, #657382 50%) calc(100% - 16px) 16px / 6px 6px no-repeat,
-      linear-gradient(135deg, #657382 50%, transparent 50%) calc(100% - 10px) 16px / 6px 6px no-repeat,
-      #fff;
-    padding-right: 30px;
-  }
-
-  .field input[aria-invalid="true"] {
-    border-color: #c84d4d;
-    background: #fff7f7;
-  }
-
-  .field-error {
-    color: #8b1e1e;
-    font-size: 12px;
-    font-weight: 650;
-    line-height: 1.3;
-  }
-
-  .switch {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    min-height: 34px;
-    margin-top: 12px;
-    color: #334252;
-    font-weight: 650;
-  }
-
-  .switch input {
-    width: 17px;
-    height: 17px;
-  }
-
-  .auto-accept-settings {
-    display: grid;
-    gap: 8px;
-    margin-top: 8px;
-    padding: 10px;
-    border: 1px solid #d6dde5;
-    border-radius: 8px;
-    background: #f8fafb;
-  }
-
-  .setting-heading,
-  .compact-field {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    color: #405060;
-    font-size: 12px;
-  }
-
-  .setting-heading strong {
-    color: #263442;
-    font-size: 13px;
-  }
-
-  .setting-heading span,
-  .setting-status {
-    font-weight: 800;
-  }
-
-  .auto-accept-settings input[type="range"] {
-    width: 100%;
-    accent-color: #2364aa;
-  }
-
-  .compact-field input {
-    width: 104px;
-    min-height: 32px;
-    border: 1px solid #ccd4dd;
-    border-radius: 7px;
-    background: #fff;
-    color: #1c2430;
-    padding: 0 8px;
-  }
-
-  .setting-status {
-    min-height: 28px;
-    display: flex;
-    align-items: center;
-    border-top: 1px solid #e1e6eb;
-    color: #2364aa;
-    font-size: 12px;
-  }
-
-  .button-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 16px;
-  }
-
-  .wide-action {
-    width: 100%;
-  }
-
-  button {
-    min-height: 38px;
-    border: 1px solid #ccd4dd;
-    border-radius: 8px;
-    background: #fff;
-    color: #263442;
-    padding: 0 12px;
-    cursor: pointer;
-    font-weight: 700;
-  }
-
-  button:disabled {
-    opacity: 0.62;
-    cursor: default;
-  }
-
-  .button-row button,
-  .primary {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 7px;
-  }
-
-  .primary {
-    background: #2364aa;
-    border-color: #2364aa;
-    color: #fff;
-  }
-
-  .primary.danger {
-    background: #a8323e;
-    border-color: #a8323e;
-  }
-
-  .segmented,
-  .startup-grid,
-  .log-filters {
-    display: grid;
-    gap: 8px;
-  }
-
-  .segmented {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .startup-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .log-filters {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-    margin-bottom: 8px;
-  }
-
-  .log-filters button {
-    min-height: 30px;
-    padding: 0 7px;
-    font-size: 12px;
-    text-transform: capitalize;
-  }
-
-  .log-filters button.active {
-    border-color: #2364aa;
-    background: #e8f1fb;
-    color: #123d6d;
-  }
-
-  .icon-action {
-    display: grid;
-    place-items: center;
-    width: 34px;
-    min-height: 34px;
-    padding: 0;
-  }
-
-  .health-steps {
-    display: grid;
-    gap: 8px;
-  }
-
-  .health-step {
-    display: grid;
-    grid-template-columns: 10px minmax(0, 1fr);
-    align-items: start;
-    gap: 9px;
-  }
-
-  .health-dot {
-    width: 10px;
-    height: 10px;
-    margin-top: 5px;
-    border-radius: 999px;
-    background: #a8b3bf;
-  }
-
-  .health-step[data-state="ready"] .health-dot {
-    background: #2364aa;
-  }
-
-  .health-step[data-state="active"] .health-dot,
-  .check-row.ok::before {
-    background: #23885a;
-  }
-
-  .health-step[data-state="warning"] .health-dot {
-    background: #b47b1f;
-  }
-
-  .health-step[data-state="error"] .health-dot,
-  .check-row::before {
-    background: #b13845;
-  }
-
-  .health-step strong,
-  .check-row strong {
-    display: block;
-    color: #263442;
-    font-size: 13px;
-    line-height: 1.25;
-  }
-
-  .health-step span:not(.health-dot),
-  .check-row span,
-  .fine-print {
-    color: #657382;
-    font-size: 12px;
-    line-height: 1.35;
-  }
-
-  .metrics {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 12px;
-  }
-
-  .metrics span,
-  .hotkeys span {
-    border: 1px solid #d6dde5;
-    border-radius: 7px;
-    background: #f8fafb;
-    color: #405060;
-    padding: 5px 8px;
-    font-size: 12px;
-    font-weight: 750;
-  }
-
-  .checks {
-    display: grid;
-    gap: 8px;
-    margin-top: 10px;
-  }
-
-  .check-row {
-    display: grid;
-    grid-template-columns: 8px minmax(0, 1fr);
-    column-gap: 8px;
-  }
-
-  .check-row::before {
-    content: "";
-    width: 8px;
-    height: 8px;
-    margin-top: 5px;
-    border-radius: 999px;
-  }
-
-  .check-row strong,
-  .check-row span {
-    grid-column: 2;
-  }
-
-  .hotkeys {
-    display: grid;
-    gap: 7px;
-  }
-
-  .fine-print {
-    margin-top: 10px;
-  }
-
-  .subhead {
-    margin: 16px 0 8px;
-    color: #5c6875;
-    font-size: 12px;
-    font-weight: 800;
-    text-transform: uppercase;
-  }
-
-  dl {
-    display: grid;
-    gap: 10px;
-    margin: 0;
-  }
-
-  dl div {
-    display: grid;
-    gap: 3px;
-  }
-
-  dt {
-    color: #657382;
-    font-size: 12px;
-    font-weight: 800;
-    text-transform: uppercase;
-  }
-
-  dd {
-    margin: 0;
-    overflow-wrap: anywhere;
-    color: #1f2d3b;
-    font-size: 13px;
-  }
-
-  .api-result {
-    display: grid;
-    gap: 8px;
-    margin-top: 12px;
-  }
-
-  .api-result-meta {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-    color: #405060;
-    font-size: 12px;
-  }
-
-  .api-result-meta span {
-    min-width: 44px;
-    border: 1px solid #e1a4a4;
-    border-radius: 7px;
-    background: #fff3f3;
-    color: #8b1e1e;
-    padding: 4px 7px;
-    text-align: center;
-    font-weight: 850;
-  }
-
-  .api-result-meta span.ok {
-    border-color: #9fd0b7;
-    background: #effaf4;
-    color: #14633f;
-  }
-
-  .api-result-meta strong {
-    min-width: 0;
-    overflow: hidden;
-    color: #263442;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .api-result pre {
-    max-height: 300px;
-    margin: 0;
-    overflow: auto;
-    border: 1px solid #d6dde5;
-    border-radius: 8px;
-    background: #101820;
-    color: #d7e2ee;
-    padding: 10px;
-    font-family: "Cascadia Mono", Consolas, monospace;
-    font-size: 12px;
-    line-height: 1.45;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    scrollbar-color: #52657a #121c26;
-    scrollbar-width: thin;
-  }
-
-  .log {
-    height: 358px;
-    overflow: auto;
-    border: 1px solid #d6dde5;
-    border-radius: 8px;
-    background: #101820;
-    padding: 10px;
-    scrollbar-color: #52657a #121c26;
-    scrollbar-width: thin;
-  }
-
-  .log::-webkit-scrollbar {
-    width: 11px;
-    height: 11px;
-  }
-
-  .log::-webkit-scrollbar-track {
-    border-radius: 0 8px 8px 0;
-    background: #121c26;
-  }
-
-  .log::-webkit-scrollbar-thumb {
-    min-height: 38px;
-    border: 3px solid #121c26;
-    border-radius: 999px;
-    background: #52657a;
-  }
-
-  .log::-webkit-scrollbar-thumb:hover {
-    background: #7890aa;
-  }
-
-  .log p {
-    margin: 0 0 6px;
-    color: #d7e2ee;
-    font-family: "Cascadia Mono", Consolas, monospace;
-    font-size: 12px;
-    line-height: 1.45;
-    overflow-wrap: anywhere;
-  }
-
-  .log p[data-level="warn"] {
-    color: #f3d28a;
-  }
-
-  .log p[data-level="error"] {
-    color: #ffb5bd;
-  }
-
-  .log p span,
-  .log p b,
-  .log p em {
-    margin-right: 7px;
-    color: #8ea0b4;
-    font-weight: 800;
-    font-style: normal;
-  }
-
-  .log p b {
-    color: #9dbfe8;
-  }
-
-  .stream-log p {
-    color: #b8ead4;
-  }
-
-  .stream-log p b {
-    color: #78d1a9;
-  }
-
-  @media (max-width: 860px) {
-    header {
-      align-items: start;
-      flex-direction: column;
-    }
-
-    .grid {
-      grid-template-columns: 1fr;
-    }
-
-    .grid.single {
-      grid-template-columns: 1fr;
-    }
-
-    .status-grid {
-      grid-template-columns: 1fr;
-    }
-
-    .launch-panel,
-    .log-panel {
-      grid-row: auto;
-    }
-  }
-
-  @media (max-width: 620px) {
-    .title-status-chip {
-      max-width: 118px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-  }
-
-  @media (max-width: 520px) {
-    .title-status {
-      display: none;
-    }
-
-    .dialog-footer {
-      display: grid;
-      grid-template-columns: 1fr;
-    }
-
-    .shell {
-      width: min(100vw - 20px, 1120px);
-      padding: 14px 0;
-    }
-
-    .game-grid,
-    .segmented,
-    .startup-grid,
-    .log-filters,
-    .tabs {
-      grid-template-columns: 1fr;
-    }
-
-    .tabs {
-      display: grid;
-    }
-
-    .state-pill {
-      white-space: normal;
-    }
-  }
-</style>

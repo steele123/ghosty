@@ -76,6 +76,16 @@ pub fn write_auto_accept_delay_ms(delay_ms: u32) -> Result<()> {
     )
 }
 
+pub fn read_discord_webhook_url() -> String {
+    read_string("discordWebhookUrl")
+        .map(|url| url.trim().to_string())
+        .unwrap_or_default()
+}
+
+pub fn write_discord_webhook_url(url: &str) -> Result<()> {
+    write_string("discordWebhookUrl", url.trim())
+}
+
 pub fn read_certificate() -> Option<Vec<u8>> {
     let mut path = data_dir().ok()?;
     path.push("localhostCert.pfx");

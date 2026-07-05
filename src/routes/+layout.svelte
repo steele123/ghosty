@@ -1,23 +1,32 @@
 <script lang="ts">
-  import { page } from "$app/stores";
-  import GhostyShell from "$lib/GhostyShell.svelte";
+	import './layout.css';
+	import { browser } from "$app/environment";
+	import { page } from "$app/stores";
+	import GhostyShell from "$lib/GhostyShell.svelte";
 
-  type AppTab = "launch" | "presence" | "utility" | "debug";
+	type AppTab = "launch" | "presence" | "utility" | "debug";
 
-  let { children } = $props();
+	let { children } = $props();
 
-  function activeTabFor(pathname: string): AppTab {
-    if (pathname.startsWith("/presence")) {
-      return "presence";
-    }
-    if (pathname.startsWith("/utility")) {
-      return "utility";
-    }
-    if (pathname.startsWith("/debug")) {
-      return "debug";
-    }
-    return "launch";
-  }
+	if (browser) {
+		document.documentElement.classList.add("dark");
+	}
+
+	function activeTabFor(pathname: string): AppTab {
+		if (pathname.startsWith("/presence")) {
+			return "presence";
+		}
+
+		if (pathname.startsWith("/utility")) {
+			return "utility";
+		}
+
+		if (pathname.startsWith("/debug")) {
+			return "debug";
+		}
+
+		return "launch";
+	}
 </script>
 
 <GhostyShell activeTab={activeTabFor($page.url.pathname)} />

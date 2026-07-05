@@ -167,6 +167,18 @@ fn set_auto_accept_delay_ms(
 }
 
 #[tauri::command]
+fn set_discord_webhook_url(
+    state: State<'_, SharedState>,
+    url: String,
+) -> Result<AppSnapshot, String> {
+    let mut state = state.lock().map_err(|e| e.to_string())?;
+    state
+        .set_discord_webhook_url(url)
+        .map_err(|e| e.to_string())?;
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
 fn set_connect_to_muc(
     state: State<'_, SharedState>,
     connect_to_muc: bool,
@@ -216,6 +228,7 @@ pub fn run() {
             set_helper_friend,
             set_auto_accept,
             set_auto_accept_delay_ms,
+            set_discord_webhook_url,
             set_connect_to_muc,
             set_startup_status
         ])
