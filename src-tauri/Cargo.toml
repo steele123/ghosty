@@ -1,6 +1,6 @@
 [package]
 name = "ghosty"
-version = "0.1.0"
+version = "0.1.1"
 description = "A Tauri/Svelte Riot presence masking tool inspired by Deceive"
 authors = ["steel"]
 license = "GPL-3.0-only"
