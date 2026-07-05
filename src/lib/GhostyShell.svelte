@@ -1,6 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { relaunch } from "@tauri-apps/plugin-process";
+  import { check } from "@tauri-apps/plugin-updater";
   import { onMount } from "svelte";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
@@ -167,9 +169,6 @@
     streamEvents: []
   });
   let selectedGame = $state<LaunchGame>("lol");
-  let gamePatchline = $state("live");
-  let riotClientParams = $state("");
-  let gameParams = $state("");
   let launchGame = $state(true);
   let pendingActions = $state(0);
   let error = $state("");
@@ -185,18 +184,19 @@
   let lcuEndpoint = $state("/lol-summoner/v1/current-summoner");
   let lcuBody = $state("");
   let lcuResponse = $state<LcuApiResponse | null>(null);
+  let updateCheckStarted = false;
   let lastStreamEventCount = 0;
   let snapshotRequestId = 0;
   let launchFormInitialized = false;
   let busy = $derived(pendingActions > 0);
-  let patchlineError = $derived(validatePatchline(gamePatchline, selectedGame));
-  let launchBlocked = $derived(busy || patchlineError !== "");
-  const appWindow = getCurrentWindow();
+  const appWindow =
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window ? getCurrentWindow() : null;
   let { activeTab = "launch" } = $props<{ activeTab?: AppTab }>();
 
   onMount(() => {
     restoreLaunchForm();
     void refresh();
+    void checkForUpdates();
     const interval = window.setInterval(() => void refresh(), 1500);
     return () => window.clearInterval(interval);
   });
@@ -250,6 +250,25 @@
     }
   }
 
+  async function checkForUpdates() {
+    if (updateCheckStarted || !appWindow) {
+      return;
+    }
+    updateCheckStarted = true;
+    try {
+      const update = await check();
+      if (!update) {
+        return;
+      }
+
+      notice = `Installing Ghosty ${update.version}. Ghosty will restart when the update is ready.`;
+      await update.downloadAndInstall();
+      await relaunch();
+    } catch (err) {
+      error = `Update check failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
   async function updateSnapshot(action: () => Promise<AppSnapshot>) {
     const requestId = ++snapshotRequestId;
     const nextSnapshot = await call(action);
@@ -261,10 +280,6 @@
   }
 
   async function start() {
-    if (patchlineError) {
-      error = patchlineError;
-      return;
-    }
     persistLaunchForm();
     const runningRiotProcesses = await call(() => invoke<string[]>("running_riot_processes"));
     if (runningRiotProcesses.length) {
@@ -279,9 +294,9 @@
     await updateSnapshot(() =>
       invoke<AppSnapshot>("start_deceive", {
         game: selectedGame,
-        gamePatchline: gamePatchline.trim(),
-        riotClientParams: riotClientParams.trim() || null,
-        gameParams: gameParams.trim() || null,
+        gamePatchline: "live",
+        riotClientParams: null,
+        gameParams: null,
         launchGame
       })
     );
@@ -311,17 +326,13 @@
   }
 
   async function cleanRestart() {
-    if (patchlineError) {
-      error = patchlineError;
-      return;
-    }
     persistLaunchForm();
     await updateSnapshot(() =>
       invoke<AppSnapshot>("clean_restart", {
         game: selectedGame,
-        gamePatchline: gamePatchline.trim(),
-        riotClientParams: riotClientParams.trim() || null,
-        gameParams: gameParams.trim() || null,
+        gamePatchline: "live",
+        riotClientParams: null,
+        gameParams: null,
         launchGame
       })
     );
@@ -428,15 +439,15 @@
   }
 
   function minimizeWindow() {
-    void appWindow.minimize();
+    void appWindow?.minimize();
   }
 
   function toggleMaximizeWindow() {
-    void appWindow.toggleMaximize();
+    void appWindow?.toggleMaximize();
   }
 
   function closeWindow() {
-    void appWindow.close();
+    void appWindow?.close();
   }
 
   function emptyHealth(): ConnectionHealth {
@@ -557,35 +568,6 @@
     persistLaunchForm();
   }
 
-  function updateGamePatchline(value: string) {
-    gamePatchline = value;
-    persistLaunchForm();
-  }
-
-  function validatePatchline(value: string, game: LaunchGame) {
-    if (game === "riotClient") {
-      return "";
-    }
-    const patchline = value.trim();
-    if (!patchline) {
-      return "Patchline is required.";
-    }
-    if (/\s/.test(patchline)) {
-      return "Patchline cannot contain spaces.";
-    }
-    return "";
-  }
-
-  function updateRiotClientParams(value: string) {
-    riotClientParams = value;
-    persistLaunchForm();
-  }
-
-  function updateGameParams(value: string) {
-    gameParams = value;
-    persistLaunchForm();
-  }
-
   function updateLaunchGame(value: boolean) {
     launchGame = value;
     persistLaunchForm();
@@ -596,9 +578,6 @@
     if (savedGame) {
       selectedGame = savedGame;
     }
-    gamePatchline = readStoredLaunchValue("gamePatchline") ?? gamePatchline;
-    riotClientParams = readStoredLaunchValue("riotClientParams") ?? riotClientParams;
-    gameParams = readStoredLaunchValue("gameParams") ?? gameParams;
     launchGame = readStoredLaunchValue("launchGame") !== "false";
   }
 
@@ -614,9 +593,6 @@
 
   function persistLaunchForm() {
     writeStoredLaunchValue("selectedGame", selectedGame);
-    writeStoredLaunchValue("gamePatchline", gamePatchline);
-    writeStoredLaunchValue("riotClientParams", riotClientParams);
-    writeStoredLaunchValue("gameParams", gameParams);
     writeStoredLaunchValue("launchGame", String(launchGame));
   }
 
@@ -827,28 +803,9 @@
         {#each games as game}
           <Button class={`game-tile ${selectedGame === game.id ? "selected" : ""}`} variant="outline" onclick={() => selectGame(game.id)}>
             <strong>{game.label}</strong>
-            <span>{game.hint}</span>
           </Button>
         {/each}
       </div>
-
-      <label class="field">
-        <span>Patchline</span>
-        <Input aria-invalid={patchlineError ? "true" : "false"} value={gamePatchline} oninput={(event) => updateGamePatchline(event.currentTarget.value)} />
-        {#if patchlineError}
-          <small class="field-error">{patchlineError}</small>
-        {/if}
-      </label>
-
-      <label class="field">
-        <span>Riot Client Params</span>
-        <Input value={riotClientParams} oninput={(event) => updateRiotClientParams(event.currentTarget.value)} placeholder="--allow-multiple-clients" />
-      </label>
-
-      <label class="field">
-        <span>Game Params</span>
-        <Input value={gameParams} oninput={(event) => updateGameParams(event.currentTarget.value)} placeholder="optional arguments after --" />
-      </label>
 
       <label class="switch">
         <input type="checkbox" checked={launchGame} onchange={(event) => updateLaunchGame(event.currentTarget.checked)} />
@@ -861,7 +818,7 @@
             <Square size={17} /> Stop
           </Button>
         {:else}
-          <Button class="primary" disabled={launchBlocked} onclick={() => runAction(start)}>
+          <Button class="primary" disabled={busy} onclick={() => runAction(start)}>
             {#if busy}<Spinner />{:else}<Power size={17} />{/if} Start
           </Button>
         {/if}
@@ -871,7 +828,7 @@
         <Button disabled={busy} variant="outline" onclick={() => runAction(killRiot)} title="Stop Riot processes">
           <Trash2 size={17} /> Kill Riot
         </Button>
-        <Button disabled={launchBlocked} variant="outline" onclick={() => runAction(cleanRestart)} title="Stop Riot, restart proxy, launch selected game">
+        <Button disabled={busy} variant="outline" onclick={() => runAction(cleanRestart)} title="Stop Riot, restart proxy, launch selected game">
           <RefreshCcw size={17} /> Clean Restart
         </Button>
       </div>
