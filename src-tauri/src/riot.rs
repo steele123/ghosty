@@ -450,8 +450,12 @@ mod tests {
     #[test]
     fn riot_process_matcher_is_case_insensitive_and_exact() {
         assert!(process_name_matches_riot_target("riotclientservices.exe"));
-        assert!(process_name_matches_riot_target("VALORANT-Win64-Shipping.exe"));
-        assert!(!process_name_matches_riot_target("RiotClientServicesHelper.exe"));
+        assert!(process_name_matches_riot_target(
+            "VALORANT-Win64-Shipping.exe"
+        ));
+        assert!(!process_name_matches_riot_target(
+            "RiotClientServicesHelper.exe"
+        ));
         assert!(!process_name_matches_riot_target("LeagueClient"));
     }
 }

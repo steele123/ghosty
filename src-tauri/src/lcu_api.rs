@@ -1,18 +1,15 @@
 use std::{
     collections::BTreeMap,
     sync::{Mutex, OnceLock},
-    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
-use reqwest::{
-    blocking::{Client, RequestBuilder},
-    header,
+use reqwest::{Method, StatusCode};
+use rusty_lcu::{
+    Credentials, CredentialsSource, EndpointParams, Error as RustyLcuError, LcuClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sysinfo::System;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,65 +24,99 @@ pub struct LcuApiResponse {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
-struct LcuAuthInfo {
-    port: u16,
-    password: String,
-}
+static LCU_CREDENTIALS_CACHE: OnceLock<Mutex<Option<Credentials>>> = OnceLock::new();
 
-static LCU_AUTH_CACHE: OnceLock<Mutex<Option<LcuAuthInfo>>> = OnceLock::new();
-
-pub fn call_endpoint(method: &str, endpoint: &str, body: Option<Value>) -> Result<LcuApiResponse> {
+pub async fn call_endpoint(
+    method: &str,
+    endpoint: &str,
+    body: Option<Value>,
+) -> Result<LcuApiResponse> {
     let method = normalize_method(method)?;
     let endpoint = normalize_endpoint(endpoint)?;
-    let auth = cached_auth_info()?;
-    match call_endpoint_with_auth(&method, &endpoint, body.clone(), &auth) {
-        Ok(response) if !auth_response_needs_refresh(&response) => Ok(response),
+    let credentials = cached_credentials().await?;
+    match call_endpoint_with_credentials(&method, &endpoint, body.clone(), &credentials).await {
+        Ok(response) if !credentials_response_needs_refresh(&response) => Ok(response),
         Ok(_) | Err(_) => {
-            clear_auth_cache();
-            let auth = refresh_auth_info()?;
-            call_endpoint_with_auth(&method, &endpoint, body, &auth)
+            clear_credentials_cache();
+            let credentials = refresh_credentials().await?;
+            call_endpoint_with_credentials(&method, &endpoint, body, &credentials).await
         }
     }
 }
 
-fn call_endpoint_with_auth(
+async fn call_endpoint_with_credentials(
     method: &str,
     endpoint: &str,
     body: Option<Value>,
-    auth: &LcuAuthInfo,
+    credentials: &Credentials,
 ) -> Result<LcuApiResponse> {
-    let url = format!("https://127.0.0.1:{}{endpoint}", auth.port);
-    let client = build_client(auth)?;
-    let request = request_builder(&client, method, &url, body)?;
-    let response = request
-        .send()
-        .with_context(|| format!("Unable to call League Client API at {url}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .context("Unable to read League Client API response")?;
-    let body = serde_json::from_str(&text).ok();
+    let url = format!("{}{}", credentials.base_url(), endpoint);
+    let method_value = Method::from_bytes(method.as_bytes())
+        .with_context(|| format!("Unsupported League Client API method: {method}"))?;
+    let client = LcuClient::with_credentials(credentials.clone())
+        .context("Unable to build League Client API client")?;
+    let mut params = EndpointParams::new();
+    if let Some(body) = body.filter(|_| method != "GET" && method != "DELETE") {
+        params = params.body(body)?;
+    }
 
-    Ok(LcuApiResponse {
-        method: method.to_string(),
-        endpoint: endpoint.to_string(),
-        url,
-        port: auth.port,
-        status: status.as_u16(),
-        ok: status.is_success(),
-        body,
-        text,
-    })
+    match client.request(method_value, endpoint, params).await {
+        Ok(body) => Ok(lcu_response_from_value(
+            method,
+            endpoint,
+            &url,
+            credentials.port,
+            StatusCode::OK,
+            body,
+        )),
+        Err(RustyLcuError::Lcu { status, body }) => Ok(LcuApiResponse {
+            method: method.to_string(),
+            endpoint: endpoint.to_string(),
+            url,
+            port: credentials.port,
+            status: status.as_u16(),
+            ok: false,
+            body: serde_json::from_str(&body).ok(),
+            text: body,
+        }),
+        Err(error) => Err(anyhow!(
+            "Unable to call League Client API at {url}: {error}"
+        )),
+    }
 }
 
-fn auth_response_needs_refresh(response: &LcuApiResponse) -> bool {
+fn lcu_response_from_value(
+    method: &str,
+    endpoint: &str,
+    url: &str,
+    port: u16,
+    status: StatusCode,
+    body: Value,
+) -> LcuApiResponse {
+    let text = if body.is_null() {
+        String::new()
+    } else {
+        serde_json::to_string(&body).unwrap_or_default()
+    };
+    LcuApiResponse {
+        method: method.to_string(),
+        endpoint: endpoint.to_string(),
+        url: url.to_string(),
+        port,
+        status: status.as_u16(),
+        ok: status.is_success(),
+        body: Some(body),
+        text,
+    }
+}
+
+fn credentials_response_needs_refresh(response: &LcuApiResponse) -> bool {
     matches!(response.status, 401 | 403)
 }
 
 #[cfg(not(test))]
-pub fn gameflow_phase() -> Result<String> {
-    let response = call_endpoint("GET", "/lol-gameflow/v1/gameflow-phase", None)?;
+pub async fn gameflow_phase() -> Result<String> {
+    let response = call_endpoint("GET", "/lol-gameflow/v1/gameflow-phase", None).await?;
     if let Some(Value::String(phase)) = response.body {
         return Ok(phase);
     }
@@ -93,29 +124,32 @@ pub fn gameflow_phase() -> Result<String> {
 }
 
 #[cfg(not(test))]
-pub fn accept_ready_check() -> Result<LcuApiResponse> {
+pub async fn accept_ready_check() -> Result<LcuApiResponse> {
     call_endpoint(
         "POST",
         "/lol-matchmaking/v1/ready-check/accept",
         Some(serde_json::json!({})),
     )
+    .await
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub fn current_summoner_opgg_link() -> Result<String> {
-    let summoner = call_endpoint("GET", "/lol-summoner/v1/current-summoner", None)?;
+pub async fn current_summoner_opgg_link() -> Result<String> {
+    let summoner = call_endpoint("GET", "/lol-summoner/v1/current-summoner", None).await?;
     let body = summoner
         .body
         .as_ref()
         .ok_or_else(|| anyhow!("League Client did not return current summoner JSON"))?;
     let (game_name, tag_line) = current_summoner_riot_id(body)?;
-    let region = current_opgg_region().unwrap_or_else(|_| "na".to_string());
+    let region = current_opgg_region()
+        .await
+        .unwrap_or_else(|_| "na".to_string());
     Ok(build_opgg_summoner_link(&region, &game_name, &tag_line))
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub fn current_summoner_display_name() -> Result<String> {
-    let summoner = call_endpoint("GET", "/lol-summoner/v1/current-summoner", None)?;
+pub async fn current_summoner_display_name() -> Result<String> {
+    let summoner = call_endpoint("GET", "/lol-summoner/v1/current-summoner", None).await?;
     let body = summoner
         .body
         .as_ref()
@@ -125,9 +159,11 @@ pub fn current_summoner_display_name() -> Result<String> {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub fn current_lobby_opgg_multisearch_link() -> Result<String> {
-    let region = current_opgg_region().unwrap_or_else(|_| "na".to_string());
-    let summoners = current_lobby_riot_ids()?;
+pub async fn current_lobby_opgg_multisearch_link() -> Result<String> {
+    let region = current_opgg_region()
+        .await
+        .unwrap_or_else(|_| "na".to_string());
+    let summoners = current_lobby_riot_ids().await?;
     if summoners.is_empty() {
         return Err(anyhow!(
             "Unable to find lobby members. Join a League lobby or champ select, then try again."
@@ -137,8 +173,8 @@ pub fn current_lobby_opgg_multisearch_link() -> Result<String> {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-pub fn current_friends_summary() -> Result<String> {
-    let response = call_endpoint("GET", "/lol-chat/v1/friends", None)?;
+pub async fn current_friends_summary() -> Result<String> {
+    let response = call_endpoint("GET", "/lol-chat/v1/friends", None).await?;
     let friends = response
         .body
         .as_ref()
@@ -148,8 +184,8 @@ pub fn current_friends_summary() -> Result<String> {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn current_opgg_region() -> Result<String> {
-    let response = call_endpoint("GET", "/riotclient/region-locale", None)?;
+async fn current_opgg_region() -> Result<String> {
+    let response = call_endpoint("GET", "/riotclient/region-locale", None).await?;
     let region = response
         .body
         .as_ref()
@@ -281,8 +317,9 @@ fn ordered_counts(counts: &BTreeMap<String, usize>, order: &[&str]) -> String {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn current_lobby_riot_ids() -> Result<Vec<(String, String)>> {
+async fn current_lobby_riot_ids() -> Result<Vec<(String, String)>> {
     let chat_participants = call_endpoint("GET", "/chat/v5/participants", None)
+        .await
         .ok()
         .and_then(|response| response.body)
         .map(|body| riot_ids_from_chat_participants(&body))
@@ -291,7 +328,7 @@ fn current_lobby_riot_ids() -> Result<Vec<(String, String)>> {
         return Ok(chat_participants);
     }
 
-    let lobby = call_endpoint("GET", "/lol-lobby/v2/lobby", None)?;
+    let lobby = call_endpoint("GET", "/lol-lobby/v2/lobby", None).await?;
     Ok(lobby
         .body
         .as_ref()
@@ -441,122 +478,40 @@ fn percent_encode_query_component(value: &str) -> String {
     })
 }
 
-fn build_client(auth: &LcuAuthInfo) -> Result<Client> {
-    let mut headers = header::HeaderMap::new();
-    let encoded = STANDARD.encode(format!("riot:{}", auth.password));
-    let value = header::HeaderValue::from_str(&format!("Basic {encoded}"))
-        .context("Unable to build League Client authorization header")?;
-    headers.insert(header::AUTHORIZATION, value);
-
-    Client::builder()
-        .danger_accept_invalid_certs(true)
-        .default_headers(headers)
-        .timeout(Duration::from_secs(6))
-        .build()
-        .context("Unable to build League Client API client")
-}
-
-fn request_builder(
-    client: &Client,
-    method: &str,
-    url: &str,
-    body: Option<Value>,
-) -> Result<RequestBuilder> {
-    let request = match method {
-        "GET" => client.get(url),
-        "POST" => client.post(url),
-        "PUT" => client.put(url),
-        "PATCH" => client.patch(url),
-        "DELETE" => client.delete(url),
-        _ => return Err(anyhow!("Unsupported League Client API method: {method}")),
-    };
-
-    Ok(match body {
-        Some(body) if method != "GET" && method != "DELETE" => request.json(&body),
-        _ => request,
-    })
-}
-
-fn find_auth_info() -> Result<LcuAuthInfo> {
-    league_client_command_lines()?
-        .into_iter()
-        .find_map(|line| auth_info_from_command_line(&line))
-        .ok_or_else(|| {
-            anyhow!(
-                "Unable to find LeagueClientUx.exe with --app-port and --remoting-auth-token. Start League Client, then try again."
-            )
-        })
-}
-
-fn cached_auth_info() -> Result<LcuAuthInfo> {
-    if let Some(auth) = auth_cache()
+async fn cached_credentials() -> Result<Credentials> {
+    if let Some(credentials) = credentials_cache()
         .lock()
-        .map_err(|e| anyhow!("Unable to read League Client auth cache: {e}"))?
+        .map_err(|e| anyhow!("Unable to read League Client credentials cache: {e}"))?
         .clone()
     {
-        return Ok(auth);
+        return Ok(credentials);
     }
-    refresh_auth_info()
+    refresh_credentials().await
 }
 
-fn refresh_auth_info() -> Result<LcuAuthInfo> {
-    let auth = find_auth_info()?;
-    *auth_cache()
+async fn refresh_credentials() -> Result<Credentials> {
+    let credentials = Credentials::discover(CredentialsSource::Auto)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "Unable to find League Client API credentials. Start League Client, then try again. ({error})"
+            )
+        })?;
+    *credentials_cache()
         .lock()
-        .map_err(|e| anyhow!("Unable to update League Client auth cache: {e}"))? = Some(auth.clone());
-    Ok(auth)
+        .map_err(|e| anyhow!("Unable to update League Client credentials cache: {e}"))? =
+        Some(credentials.clone());
+    Ok(credentials)
 }
 
-fn clear_auth_cache() {
-    if let Ok(mut cache) = auth_cache().lock() {
+fn clear_credentials_cache() {
+    if let Ok(mut cache) = credentials_cache().lock() {
         *cache = None;
     }
 }
 
-fn auth_cache() -> &'static Mutex<Option<LcuAuthInfo>> {
-    LCU_AUTH_CACHE.get_or_init(|| Mutex::new(None))
-}
-
-fn league_client_command_lines() -> Result<Vec<String>> {
-    Ok(System::new_all()
-        .processes()
-        .values()
-        .filter(|process| {
-            process
-                .name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("LeagueClientUx.exe")
-        })
-        .map(|process| {
-            process
-                .cmd()
-                .iter()
-                .map(|part| part.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|line| !line.trim().is_empty())
-        .collect())
-}
-
-fn auth_info_from_command_line(command_line: &str) -> Option<LcuAuthInfo> {
-    let port = parse_arg_value(command_line, "--app-port=")?
-        .parse::<u16>()
-        .ok()?;
-    let password = parse_arg_value(command_line, "--remoting-auth-token=")
-        .or_else(|| parse_arg_value(command_line, "--riotclient-auth-token="))?;
-    Some(LcuAuthInfo { port, password })
-}
-
-fn parse_arg_value(command_line: &str, prefix: &str) -> Option<String> {
-    let start = command_line.find(prefix)? + prefix.len();
-    let rest = &command_line[start..];
-    let rest = rest.trim_start_matches('"');
-    let value: String = rest
-        .chars()
-        .take_while(|ch| !ch.is_whitespace() && *ch != '"')
-        .collect();
-    (!value.is_empty()).then_some(value)
+fn credentials_cache() -> &'static Mutex<Option<Credentials>> {
+    LCU_CREDENTIALS_CACHE.get_or_init(|| Mutex::new(None))
 }
 
 fn normalize_method(method: &str) -> Result<String> {
@@ -606,27 +561,12 @@ fn normalize_endpoint(endpoint: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        auth_info_from_command_line, build_opgg_multisearch_link, build_opgg_summoner_link,
-        current_summoner_riot_id, format_friends_summary, friends_from_value, normalize_endpoint,
-        normalize_method, opgg_region_slug, parse_arg_value, riot_ids_from_chat_participants,
+        build_opgg_multisearch_link, build_opgg_summoner_link, current_summoner_riot_id,
+        format_friends_summary, friends_from_value, lcu_response_from_value, normalize_endpoint,
+        normalize_method, opgg_region_slug, riot_ids_from_chat_participants,
     };
+    use reqwest::StatusCode;
     use serde_json::json;
-
-    #[test]
-    fn parses_lcu_auth_from_command_line() {
-        let line = r#""C:\Riot Games\League of Legends\LeagueClientUx.exe" "--app-port=53122" "--remoting-auth-token=secret-token" --no-proxy-server"#;
-        let auth = auth_info_from_command_line(line).expect("auth should parse");
-        assert_eq!(auth.port, 53122);
-        assert_eq!(auth.password, "secret-token");
-    }
-
-    #[test]
-    fn parses_unquoted_arg_values() {
-        assert_eq!(
-            parse_arg_value("--app-port=12345 --remoting-auth-token=abc", "--app-port="),
-            Some("12345".to_string())
-        );
-    }
 
     #[test]
     fn normalizes_lcu_endpoints_and_methods() {
@@ -648,6 +588,26 @@ mod tests {
         assert!(normalize_endpoint("../lol-chat/v1/friends").is_err());
         assert!(normalize_endpoint("/lol-chat/v1/friends#fragment").is_err());
         assert!(normalize_method("TRACE").is_err());
+    }
+
+    #[test]
+    fn response_wrapper_preserves_debug_fields() {
+        let response = lcu_response_from_value(
+            "GET",
+            "/lol-test/v1/example",
+            "https://127.0.0.1:1234/lol-test/v1/example",
+            1234,
+            StatusCode::OK,
+            json!({ "ok": true }),
+        );
+
+        assert_eq!(response.method, "GET");
+        assert_eq!(response.endpoint, "/lol-test/v1/example");
+        assert_eq!(response.port, 1234);
+        assert_eq!(response.status, 200);
+        assert!(response.ok);
+        assert_eq!(response.body, Some(json!({ "ok": true })));
+        assert_eq!(response.text, r#"{"ok":true}"#);
     }
 
     #[test]

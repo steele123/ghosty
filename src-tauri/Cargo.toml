@@ -1,6 +1,6 @@
 [package]
 name = "ghosty"
-version = "0.1.1"
+version = "0.1.2"
 description = "A Tauri/Svelte Riot presence masking tool inspired by Deceive"
 authors = ["steel"]
 license = "GPL-3.0-only"
@@ -31,6 +31,7 @@ dirs = "6"
 native-tls = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 xmltree = "0.11"
+rusty_lcu = { package = "rusty-lcu", git = "https://github.com/steele123/rusty-lcu.git" }
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 sysinfo = "0.38.4"

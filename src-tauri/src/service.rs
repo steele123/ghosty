@@ -589,7 +589,7 @@ fn start_auto_accept_monitor(
                 continue;
             }
 
-            match lcu_api::gameflow_phase() {
+            match tauri::async_runtime::block_on(lcu_api::gameflow_phase()) {
                 Ok(phase) => {
                     if phase != last_phase {
                         last_phase = phase.clone();
@@ -614,7 +614,8 @@ fn start_auto_accept_monitor(
                             );
                             sleep_auto_accept_delay(&enabled, delay);
                             if enabled.load(Ordering::Relaxed) {
-                                match lcu_api::accept_ready_check() {
+                                match tauri::async_runtime::block_on(lcu_api::accept_ready_check())
+                                {
                                     Ok(response) if response.ok => {
                                         set_auto_accept_state(&state, "Accepted ready check");
                                         push_log_to(
@@ -682,15 +683,16 @@ fn notify_discord_auto_accept(
         return;
     }
 
-    let ign = lcu_api::current_summoner_display_name().unwrap_or_else(|error| {
-        push_log_to(
-            logs,
-            LogCategory::System,
-            LogLevel::Warn,
-            format!("Unable to resolve summoner name for Discord webhook: {error:#}"),
-        );
-        "Ghosty".to_string()
-    });
+    let ign = tauri::async_runtime::block_on(lcu_api::current_summoner_display_name())
+        .unwrap_or_else(|error| {
+            push_log_to(
+                logs,
+                LogCategory::System,
+                LogLevel::Warn,
+                format!("Unable to resolve summoner name for Discord webhook: {error:#}"),
+            );
+            "Ghosty".to_string()
+        });
     let content = format!("{ign} has auto accepted a game");
     match post_discord_webhook(&webhook_url, &content) {
         Ok(()) => push_log_to(
@@ -2556,17 +2558,17 @@ fn helper_auto_accept_message(
 
 #[cfg(not(test))]
 fn current_user_opgg_link() -> Result<String> {
-    lcu_api::current_summoner_opgg_link()
+    tauri::async_runtime::block_on(lcu_api::current_summoner_opgg_link())
 }
 
 #[cfg(not(test))]
 fn current_lobby_opgg_multisearch_link() -> Result<String> {
-    lcu_api::current_lobby_opgg_multisearch_link()
+    tauri::async_runtime::block_on(lcu_api::current_lobby_opgg_multisearch_link())
 }
 
 #[cfg(not(test))]
 fn current_friends_summary() -> Result<String> {
-    lcu_api::current_friends_summary()
+    tauri::async_runtime::block_on(lcu_api::current_friends_summary())
 }
 
 #[cfg(test)]

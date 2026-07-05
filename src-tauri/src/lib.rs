@@ -42,12 +42,14 @@ fn running_riot_processes() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-fn call_lcu_api(
+async fn call_lcu_api(
     method: String,
     endpoint: String,
     body: Option<serde_json::Value>,
 ) -> Result<lcu_api::LcuApiResponse, String> {
-    lcu_api::call_endpoint(&method, &endpoint, body).map_err(|e| e.to_string())
+    lcu_api::call_endpoint(&method, &endpoint, body)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
