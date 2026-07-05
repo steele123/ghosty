@@ -11,6 +11,8 @@ Inspired by [molenzwiebel/Deceive](https://github.com/molenzwiebel/Deceive).
 
 Download the latest Windows installer from the [latest Ghosty release](https://github.com/steele123/ghosty/releases/latest).
 
+![Ghosty app screenshot](images/tool.png)
+
 ## Features
 
 - Tauri desktop control panel built with Svelte 5.
