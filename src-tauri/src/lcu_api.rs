@@ -191,13 +191,18 @@ pub async fn current_friends_summary() -> Result<String> {
 
 #[cfg_attr(test, allow(dead_code))]
 async fn current_opgg_region() -> Result<String> {
+    Ok(opgg_region_slug(&current_platform_region().await?))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub async fn current_platform_region() -> Result<String> {
     let response = call_endpoint("GET", "/riotclient/region-locale", None).await?;
     let region = response
         .body
         .as_ref()
         .and_then(|body| string_field(body, "region").or_else(|| string_field(body, "webRegion")))
         .ok_or_else(|| anyhow!("League Client did not return a region"))?;
-    Ok(opgg_region_slug(region))
+    Ok(region.trim().to_string())
 }
 
 fn current_summoner_riot_id(body: &Value) -> Result<(String, String)> {

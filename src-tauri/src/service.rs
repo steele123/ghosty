@@ -2523,6 +2523,11 @@ fn helper_command_reply_for_text(
         }))
     } else if command == "friends_summary" {
         Ok(Some(current_friends_summary()?))
+    } else if command == "cutoff" {
+        Ok(Some(match current_ladder_cutoff_message() {
+            Ok(message) => message,
+            Err(error) => format!("I couldn't get LadderEye cutoffs right now: {error:#}"),
+        }))
     } else if command == "status" {
         Ok(Some(helper_status_message(
             enabled,
@@ -2550,6 +2555,12 @@ fn helper_command_kind(command: &str) -> Option<&'static str> {
     }
     if contains_command_word(&command, "friend") || contains_command_word(&command, "friends") {
         return Some("friends_summary");
+    }
+    if contains_command_word(&command, "cutoff")
+        || contains_command_word(&command, "cutoffs")
+        || contains_command_phrase(&command, &["ladder", "cutoff"])
+    {
+        return Some("cutoff");
     }
     if contains_command_word(&command, "multi")
         || contains_command_phrase(&command, &["lobby", "link"])
@@ -2598,7 +2609,7 @@ fn helper_intro_message(
     auto_accept_state: &Arc<Mutex<String>>,
 ) -> String {
     helper_status_message(enabled, status, auto_accept, auto_accept_state)
-        .unwrap_or_else(|_| format!("Ghosty is running. {}", helper_command_help_message()))
+        .unwrap_or_else(|_| format!("Ghosty is running. {}", helper_command_hint_message()))
 }
 
 fn helper_status_message(
@@ -2619,12 +2630,16 @@ fn helper_status_message(
     let auto_accept = helper_auto_accept_message(auto_accept, auto_accept_state)?;
     Ok(format!(
         "You are appearing {status}. Presence masking is {masking}. {auto_accept} {}",
-        helper_command_help_message()
+        helper_command_hint_message()
     ))
 }
 
+fn helper_command_hint_message() -> &'static str {
+    "Type help to see available commands."
+}
+
 fn helper_command_help_message() -> &'static str {
-    "Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
+    "Available commands: online, offline, mobile, enable, disable, status, friends, cutoff, auto accept on, auto accept off, auto accept status, opgg, opgg multi."
 }
 
 fn helper_auto_accept_message(
@@ -2649,6 +2664,80 @@ fn helper_lobby_unavailable_message(error: &anyhow::Error) -> String {
     } else {
         format!("I couldn't get your lobby right now: {error:#}")
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LadderCutoffResponse {
+    solo_queue: LadderCutoffQueue,
+    flex_queue: LadderCutoffQueue,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LadderCutoffQueue {
+    grandmaster_cutoff_lp: i32,
+    challenger_cutoff_lp: i32,
+    total_masters: i32,
+    last_updated: String,
+}
+
+fn format_ladder_cutoff_message(region: &str, cutoff: &LadderCutoffResponse) -> String {
+    format!(
+        "{} cutoffs: Solo GM {} LP, Challenger {} LP, Masters {}; Flex GM {} LP, Challenger {} LP, Masters {}. Updated {}.",
+        region.to_ascii_uppercase(),
+        cutoff.solo_queue.grandmaster_cutoff_lp,
+        cutoff.solo_queue.challenger_cutoff_lp,
+        cutoff.solo_queue.total_masters,
+        cutoff.flex_queue.grandmaster_cutoff_lp,
+        cutoff.flex_queue.challenger_cutoff_lp,
+        cutoff.flex_queue.total_masters,
+        cutoff.solo_queue.last_updated
+    )
+}
+
+#[cfg(not(test))]
+fn current_ladder_cutoff_message() -> Result<String> {
+    let platform_region = tauri::async_runtime::block_on(lcu_api::current_platform_region())
+        .context("Unable to read League Client region")?;
+    let ladder_region = laddereye_region_slug(&platform_region)?;
+    let url = format!("https://api.laddereye.com/{ladder_region}/ladder/cutoff/current");
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .context("Unable to build LadderEye cutoff client")?
+        .get(&url)
+        .send()
+        .context("Unable to fetch LadderEye cutoff")?;
+    if !response.status().is_success() {
+        return Err(anyhow!("LadderEye returned HTTP {}", response.status()));
+    }
+    let cutoff = response
+        .json::<LadderCutoffResponse>()
+        .context("Unable to read LadderEye cutoff response")?;
+    Ok(format_ladder_cutoff_message(&ladder_region, &cutoff))
+}
+
+fn laddereye_region_slug(region: &str) -> Result<String> {
+    let normalized = region.trim().to_ascii_uppercase();
+    let slug = match normalized.as_str() {
+        "BR" | "BR1" => "br1",
+        "EUN" | "EUN1" | "EUNE" => "eun1",
+        "EUW" | "EUW1" => "euw1",
+        "JP" | "JP1" => "jp1",
+        "KR" => "kr",
+        "LA1" | "LAN" => "la1",
+        "LA2" | "LAS" => "la2",
+        "NA" | "NA1" => "na1",
+        "OC" | "OC1" | "OCE" => "oc1",
+        "TR" | "TR1" => "tr1",
+        other => {
+            return Err(anyhow!(
+                "LadderEye cutoffs are not configured for region {other}"
+            ));
+        }
+    };
+    Ok(slug.to_string())
 }
 
 #[cfg(not(test))]
@@ -2682,6 +2771,11 @@ fn current_friends_summary() -> Result<String> {
         "Friends: 3 total. Statuses: online 1, mobile 1, offline 1. Products: League 1, Riot Mobile 1, Unknown 1."
             .to_string(),
     )
+}
+
+#[cfg(test)]
+fn current_ladder_cutoff_message() -> Result<String> {
+    Ok("NA1 cutoffs: Solo GM 876 LP, Challenger 1312 LP, Masters 10000; Flex GM 400 LP, Challenger 1099 LP, Masters 1241. Updated 2026-07-06T05:12:30.1369242Z.".to_string())
 }
 
 fn helper_status_label(status: PresenceStatus) -> &'static str {
@@ -3491,7 +3585,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
+            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Type help to see available commands."
         );
         assert_eq!(
             *status.lock().expect("status poisoned"),
@@ -3511,7 +3605,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing offline. Presence masking is disabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
+            "You are appearing offline. Presence masking is disabled. Auto accept is disabled. Client state: Disabled. Type help to see available commands."
         );
     }
 
@@ -3526,7 +3620,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "You are appearing mobile. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
+            "You are appearing mobile. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Type help to see available commands."
         );
     }
 
@@ -3580,11 +3674,11 @@ mod tests {
             ("disable", "Ghosty is now disabled."),
             (
                 "status",
-                "You are appearing mobile. Presence masking is disabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi.",
+                "You are appearing mobile. Presence masking is disabled. Auto accept is disabled. Client state: Disabled. Type help to see available commands.",
             ),
             (
                 "help",
-                "Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi.",
+                "Available commands: online, offline, mobile, enable, disable, status, friends, cutoff, auto accept on, auto accept off, auto accept status, opgg, opgg multi.",
             ),
             ("auto accept", "Auto accept is now enabled."),
             ("auto accept on", "Auto accept is now enabled."),
@@ -3605,6 +3699,10 @@ mod tests {
             (
                 "friends status",
                 "Friends: 3 total. Statuses: online 1, mobile 1, offline 1. Products: League 1, Riot Mobile 1, Unknown 1.",
+            ),
+            (
+                "cutoff",
+                "NA1 cutoffs: Solo GM 876 LP, Challenger 1312 LP, Masters 10000; Flex GM 400 LP, Challenger 1099 LP, Masters 1241. Updated 2026-07-06T05:12:30.1369242Z.",
             ),
         ];
 
@@ -3646,6 +3744,27 @@ mod tests {
     }
 
     #[test]
+    fn ladder_cutoff_message_formats_api_response() {
+        let cutoff: LadderCutoffResponse = serde_json::from_str(
+            r#"{"soloQueue":{"queueType":"RANKED_SOLO_5x5","grandmasterCutoffLp":876,"challengerCutoffLp":1312,"totalMasters":10000,"lastUpdated":"2026-07-06T05:12:30.1369242Z"},"flexQueue":{"queueType":"RANKED_FLEX_SR","grandmasterCutoffLp":400,"challengerCutoffLp":1099,"totalMasters":1241,"lastUpdated":"2026-07-06T05:12:30.1369242Z"}}"#,
+        )
+        .expect("cutoff response should deserialize");
+
+        assert_eq!(
+            format_ladder_cutoff_message("na1", &cutoff),
+            "NA1 cutoffs: Solo GM 876 LP, Challenger 1312 LP, Masters 10000; Flex GM 400 LP, Challenger 1099 LP, Masters 1241. Updated 2026-07-06T05:12:30.1369242Z."
+        );
+    }
+
+    #[test]
+    fn laddereye_region_slug_maps_lcu_regions() {
+        assert_eq!(laddereye_region_slug("NA").unwrap(), "na1");
+        assert_eq!(laddereye_region_slug("EUW1").unwrap(), "euw1");
+        assert_eq!(laddereye_region_slug("EUNE").unwrap(), "eun1");
+        assert!(laddereye_region_slug("PBE").is_err());
+    }
+
+    #[test]
     fn helper_command_reply_ignores_unknown_words() {
         let enabled = Arc::new(AtomicBool::new(true));
         let status = Arc::new(Mutex::new(PresenceStatus::Chat));
@@ -3679,7 +3798,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
+            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Type help to see available commands."
         );
     }
 
@@ -4011,7 +4130,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Send online, offline, mobile, enable, disable, status, friends, auto accept on, auto accept off, auto accept status, opgg, or opgg multi."
+            "You are appearing online. Presence masking is enabled. Auto accept is disabled. Client state: Disabled. Type help to see available commands."
         );
         assert!(passthrough.contains("</presence>"));
         assert!(passthrough.contains('\n'));
