@@ -6,6 +6,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use reqwest::{Method, StatusCode};
 use rusty_lcu::{
+    generated::{self, models},
     Credentials, CredentialsSource, EndpointParams, Error as RustyLcuError, LcuClient,
 };
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,11 @@ async fn call_endpoint_with_credentials(
             "Unable to call League Client API at {url}: {error}"
         )),
     }
+}
+
+async fn generated_client() -> Result<LcuClient> {
+    let credentials = cached_credentials().await?;
+    LcuClient::with_credentials(credentials).context("Unable to build League Client API client")
 }
 
 fn lcu_response_from_value(
@@ -318,61 +324,230 @@ fn ordered_counts(counts: &BTreeMap<String, usize>, order: &[&str]) -> String {
 
 #[cfg_attr(test, allow(dead_code))]
 async fn current_lobby_riot_ids() -> Result<Vec<(String, String)>> {
-    let chat_participants = call_endpoint("GET", "/chat/v5/participants", None)
+    if let Ok(session) = current_champ_select_session().await {
+        let mut champ_select_ids = riot_ids_from_typed_champ_select_session(&session);
+        if champ_select_ids.is_empty() {
+            let summoner_ids = summoner_ids_from_typed_champ_select_session(&session);
+            champ_select_ids = resolve_summoner_ids(&summoner_ids).await;
+        }
+        if !champ_select_ids.is_empty() {
+            return Ok(champ_select_ids);
+        }
+    }
+
+    if let Ok(lobby) = current_lobby().await {
+        let mut lobby_ids = riot_ids_from_typed_lobby(&lobby);
+        if lobby_ids.is_empty() {
+            let summoner_ids = summoner_ids_from_typed_lobby(&lobby);
+            lobby_ids = resolve_summoner_ids(&summoner_ids).await;
+        }
+        if !lobby_ids.is_empty() {
+            return Ok(lobby_ids);
+        }
+    }
+
+    let chat_participants = current_chat_participants()
         .await
-        .ok()
-        .and_then(|response| response.body)
-        .map(|body| riot_ids_from_chat_participants(&body))
+        .map(|participants| riot_ids_from_typed_chat_participants(&participants))
         .unwrap_or_default();
     if !chat_participants.is_empty() {
         return Ok(chat_participants);
     }
 
-    let lobby = call_endpoint("GET", "/lol-lobby/v2/lobby", None).await?;
-    Ok(lobby
-        .body
-        .as_ref()
-        .map(riot_ids_from_lobby)
-        .unwrap_or_default())
+    Ok(Vec::new())
 }
 
-fn riot_ids_from_chat_participants(body: &Value) -> Vec<(String, String)> {
-    let Some(participants) = body.get("participants").and_then(Value::as_array) else {
-        return Vec::new();
+async fn current_champ_select_session() -> Result<models::TeamBuilderDirectChampSelectSession> {
+    let client = generated_client().await?;
+    generated::get_lol_champ_select_v1_session_typed(&client, EndpointParams::new())
+        .await
+        .context("Unable to read League champ select session")
+}
+
+async fn current_lobby() -> Result<models::LolLobbyLobbyDto> {
+    let client = generated_client().await?;
+    generated::get_lol_lobby_v2_lobby_typed(&client, EndpointParams::new())
+        .await
+        .context("Unable to read League lobby")
+}
+
+async fn current_chat_participants() -> Result<models::LolChatParticipantList> {
+    let client = generated_client().await?;
+    client
+        .get_as("/chat/v5/participants")
+        .await
+        .context("Unable to read League chat participants")
+}
+
+async fn resolve_summoner_ids(summoner_ids: &[u64]) -> Vec<(String, String)> {
+    let mut ids = Vec::new();
+    let Ok(client) = generated_client().await else {
+        return ids;
     };
+    for summoner_id in summoner_ids {
+        let params = EndpointParams::new().path("id", *summoner_id);
+        if let Ok(summoner) =
+            generated::get_lol_summoner_v1_summoners_by_id_typed(&client, params).await
+        {
+            ids.push((summoner.game_name, summoner.tag_line));
+        }
+    }
+    dedupe_riot_ids(&mut ids);
+    ids
+}
+
+fn riot_ids_from_typed_champ_select_session(
+    session: &models::TeamBuilderDirectChampSelectSession,
+) -> Vec<(String, String)> {
+    let mut ids = session
+        .my_team
+        .iter()
+        .filter_map(riot_id_from_typed_champ_select_player)
+        .collect::<Vec<_>>();
+    dedupe_riot_ids(&mut ids);
+    ids
+}
+
+fn riot_id_from_typed_champ_select_player(
+    player: &models::TeamBuilderDirectChampSelectPlayerSelection,
+) -> Option<(String, String)> {
+    (!player.game_name.trim().is_empty() && !player.tag_line.trim().is_empty()).then(|| {
+        (
+            player.game_name.trim().to_string(),
+            player.tag_line.trim().to_string(),
+        )
+    })
+}
+
+fn summoner_ids_from_typed_champ_select_session(
+    session: &models::TeamBuilderDirectChampSelectSession,
+) -> Vec<u64> {
+    let mut ids = session
+        .my_team
+        .iter()
+        .map(|member| member.summoner_id)
+        .filter(|id| *id > 0)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn riot_ids_from_typed_lobby(lobby: &models::LolLobbyLobbyDto) -> Vec<(String, String)> {
+    let mut ids = lobby
+        .members
+        .iter()
+        .filter_map(riot_id_from_typed_lobby_member)
+        .collect::<Vec<_>>();
+    dedupe_riot_ids(&mut ids);
+    ids
+}
+
+fn riot_id_from_typed_lobby_member(
+    member: &models::LolLobbyLobbyParticipantDto,
+) -> Option<(String, String)> {
+    split_riot_id(&member.summoner_name)
+}
+
+fn summoner_ids_from_typed_lobby(lobby: &models::LolLobbyLobbyDto) -> Vec<u64> {
+    let mut ids = lobby
+        .members
+        .iter()
+        .map(|member| member.summoner_id)
+        .filter(|id| *id > 0)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn riot_ids_from_typed_chat_participants(
+    participants: &models::LolChatParticipantList,
+) -> Vec<(String, String)> {
     let mut ids = participants
+        .participants
         .iter()
-        .filter(|participant| {
-            string_field(participant, "cid")
-                .map(|cid| cid.contains("champ-select"))
-                .unwrap_or(false)
-        })
+        .filter(|participant| participant.cid.contains("champ-select"))
+        .filter_map(riot_id_from_typed_chat_participant)
+        .collect::<Vec<_>>();
+    dedupe_riot_ids(&mut ids);
+    ids
+}
+
+fn riot_id_from_typed_chat_participant(
+    participant: &models::LolChatParticipant,
+) -> Option<(String, String)> {
+    if !participant.game_name.trim().is_empty() && !participant.game_tag.trim().is_empty() {
+        return Some((
+            participant.game_name.trim().to_string(),
+            participant.game_tag.trim().to_string(),
+        ));
+    }
+    split_riot_id(&participant.name)
+}
+
+#[cfg(test)]
+fn riot_ids_from_champ_select_session(body: &Value) -> Vec<(String, String)> {
+    let mut ids = body
+        .get("myTeam")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter_map(riot_id_from_value)
         .collect::<Vec<_>>();
     dedupe_riot_ids(&mut ids);
     ids
 }
 
-#[cfg_attr(test, allow(dead_code))]
-fn riot_ids_from_lobby(body: &Value) -> Vec<(String, String)> {
-    let Some(members) = body.get("members").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut ids = members
-        .iter()
-        .filter_map(riot_id_from_value)
+#[cfg(test)]
+fn summoner_ids_from_champ_select_session(body: &Value) -> Vec<u64> {
+    summoner_ids_from_array_field(body, "myTeam")
+}
+
+#[cfg(test)]
+fn summoner_ids_from_lobby(body: &Value) -> Vec<u64> {
+    summoner_ids_from_array_field(body, "members")
+}
+
+#[cfg(test)]
+fn summoner_ids_from_array_field(body: &Value, field: &str) -> Vec<u64> {
+    let mut ids = body
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(summoner_id_from_value)
         .collect::<Vec<_>>();
-    dedupe_riot_ids(&mut ids);
+    ids.sort_unstable();
+    ids.dedup();
     ids
+}
+
+#[cfg(test)]
+fn summoner_id_from_value(body: &Value) -> Option<u64> {
+    body.get("summonerId")
+        .or_else(|| body.get("summoner_id"))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
 }
 
 fn riot_id_from_value(body: &Value) -> Option<(String, String)> {
     if let (Some(game_name), Some(tag_line)) = (
-        string_field(body, "gameName").or_else(|| string_field(body, "game_name")),
+        string_field(body, "gameName")
+            .or_else(|| string_field(body, "game_name"))
+            .or_else(|| string_field(body, "riotIdGameName"))
+            .or_else(|| string_field(body, "riot_id_game_name")),
         string_field(body, "tagLine")
             .or_else(|| string_field(body, "tagline"))
             .or_else(|| string_field(body, "gameTag"))
-            .or_else(|| string_field(body, "game_tag")),
+            .or_else(|| string_field(body, "game_tag"))
+            .or_else(|| string_field(body, "riotIdTagLine"))
+            .or_else(|| string_field(body, "riotIdTagline"))
+            .or_else(|| string_field(body, "riot_id_tag_line"))
+            .or_else(|| string_field(body, "riot_id_tagline")),
     ) {
         if !game_name.trim().is_empty() && !tag_line.trim().is_empty() {
             return Some((game_name.trim().to_string(), tag_line.trim().to_string()));
@@ -430,9 +605,9 @@ fn build_opgg_multisearch_link(region: &str, summoners: &[(String, String)]) -> 
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "https://op.gg/lol/multisearch/{}?summoners={}",
-        opgg_region_slug(region),
-        percent_encode_query_component(&summoners)
+        "https://op.gg/lol/multisearch?summoners={}&region={}",
+        percent_encode_query_component(&summoners),
+        opgg_region_slug(region)
     )
 }
 
@@ -563,9 +738,12 @@ mod tests {
     use super::{
         build_opgg_multisearch_link, build_opgg_summoner_link, current_summoner_riot_id,
         format_friends_summary, friends_from_value, lcu_response_from_value, normalize_endpoint,
-        normalize_method, opgg_region_slug, riot_ids_from_chat_participants,
+        normalize_method, opgg_region_slug, riot_ids_from_champ_select_session,
+        riot_ids_from_typed_chat_participants, summoner_ids_from_champ_select_session,
+        summoner_ids_from_lobby,
     };
     use reqwest::StatusCode;
+    use rusty_lcu::generated::models;
     use serde_json::json;
 
     #[test]
@@ -648,27 +826,15 @@ mod tests {
 
     #[test]
     fn reads_champ_select_riot_ids_from_chat_participants() {
-        let value = json!({
-            "participants": [
-                {
-                    "cid": "lol-champ-select-1",
-                    "game_name": "Ghosty",
-                    "game_tag": "NA1"
-                },
-                {
-                    "cid": "lol-champ-select-1",
-                    "gameName": "Duo User",
-                    "tagLine": "NA2"
-                },
-                {
-                    "cid": "other-chat",
-                    "game_name": "Ignored",
-                    "game_tag": "NA3"
-                }
-            ]
-        });
+        let value = models::LolChatParticipantList {
+            participants: vec![
+                chat_participant("lol-champ-select-1", "Ghosty", "NA1", "ignored"),
+                chat_participant("lol-champ-select-1", "", "", "Duo User#NA2"),
+                chat_participant("other-chat", "Ignored", "NA3", "Ignored#NA3"),
+            ],
+        };
 
-        let ids = riot_ids_from_chat_participants(&value);
+        let ids = riot_ids_from_typed_chat_participants(&value);
 
         assert_eq!(
             ids,
@@ -677,6 +843,74 @@ mod tests {
                 ("Duo User".to_string(), "NA2".to_string())
             ]
         );
+    }
+
+    fn chat_participant(
+        cid: &str,
+        game_name: &str,
+        game_tag: &str,
+        name: &str,
+    ) -> models::LolChatParticipant {
+        models::LolChatParticipant {
+            cid: cid.to_string(),
+            game_name: game_name.to_string(),
+            game_tag: game_tag.to_string(),
+            muted: false,
+            name: name.to_string(),
+            pid: String::new(),
+            puuid: String::new(),
+            region: "NA1".to_string(),
+        }
+    }
+
+    #[test]
+    fn reads_champ_select_riot_ids_from_session() {
+        let value = json!({
+            "myTeam": [
+                {
+                    "riotIdGameName": "Ghosty",
+                    "riotIdTagLine": "NA1",
+                    "summonerId": 123
+                },
+                {
+                    "gameName": "Duo User",
+                    "tagLine": "NA2",
+                    "summonerId": 456
+                }
+            ],
+            "theirTeam": [
+                {
+                    "riotIdGameName": "Enemy",
+                    "riotIdTagLine": "NA3",
+                    "summonerId": 789
+                }
+            ]
+        });
+
+        assert_eq!(
+            riot_ids_from_champ_select_session(&value),
+            vec![
+                ("Ghosty".to_string(), "NA1".to_string()),
+                ("Duo User".to_string(), "NA2".to_string())
+            ]
+        );
+        assert_eq!(
+            summoner_ids_from_champ_select_session(&value),
+            vec![123, 456]
+        );
+    }
+
+    #[test]
+    fn reads_lobby_summoner_ids() {
+        let value = json!({
+            "members": [
+                { "summonerId": 456 },
+                { "summonerId": "123" },
+                { "summonerId": 456 }
+            ]
+        });
+
+        assert_eq!(summoner_ids_from_lobby(&value), vec![123, 456]);
     }
 
     #[test]
@@ -688,7 +922,7 @@ mod tests {
 
         assert_eq!(
             build_opgg_multisearch_link("NA1", &ids),
-            "https://op.gg/lol/multisearch/na?summoners=Ghosty%23NA1%2CDuo%20User%23N%232"
+            "https://op.gg/lol/multisearch?summoners=Ghosty%23NA1%2CDuo%20User%23N%232&region=na"
         );
     }
 

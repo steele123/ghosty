@@ -69,6 +69,7 @@ pub struct AppSnapshot {
     pub auto_accept: bool,
     pub auto_accept_delay_ms: u32,
     pub auto_accept_state: String,
+    pub league_client_state: String,
     pub discord_webhook_url: String,
     pub status: PresenceStatus,
     pub startup_status: StartupStatus,

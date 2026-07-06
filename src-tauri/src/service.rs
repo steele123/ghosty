@@ -149,6 +149,7 @@ impl AppState {
                 .lock()
                 .map(|state| state.clone())
                 .unwrap_or_else(|_| "Unavailable".to_string()),
+            league_client_state: league_client_state(),
             discord_webhook_url: self
                 .discord_webhook_url
                 .lock()
@@ -743,6 +744,30 @@ fn set_auto_accept_state(state: &Arc<Mutex<String>>, value: impl Into<String>) {
     }
 }
 
+fn league_client_state() -> String {
+    match riot::running_riot_processes() {
+        Ok(processes) => league_client_state_from_processes(&processes).to_string(),
+        Err(_) => "Unavailable".to_string(),
+    }
+}
+
+fn league_client_state_from_processes(processes: &[String]) -> &'static str {
+    if processes.iter().any(|process| {
+        matches!(
+            process.as_str(),
+            "LeagueClient"
+                | "LeagueClientUx"
+                | "LeagueClientUxRender"
+                | "RiotClientServices"
+                | "RiotClientUx"
+        )
+    }) {
+        "Running"
+    } else {
+        "Stopped"
+    }
+}
+
 #[cfg(not(test))]
 fn push_log_to(
     logs: &Arc<Mutex<Vec<LogEntry>>>,
@@ -908,6 +933,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
     );
     let mut helper_command_buffer = HelperCommandBuffer::new(helper_jid.clone());
     let mut presence_buffer = ClientPresenceBuffer::new();
+    let mut status_broadcaster = StatusBroadcaster::new(status_value(&context.status));
     let mut server_presence_stats = PresenceStats::default();
     let mut roster_jid_domains = std::collections::BTreeMap::<String, String>::new();
     let mut roster_domains_logged = false;
@@ -953,6 +979,22 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
         }
         was_helper_friend_enabled = helper_friend_enabled;
 
+        if let Some(update) = status_broadcaster.poll_update(
+            status_value(&context.status),
+            context.enabled.load(Ordering::Relaxed),
+            &mut valorant_version,
+        )? {
+            made_progress = true;
+            log_stream_bytes(&context.stream_tx, "ghosty -> riot status update", &update);
+            outgoing.write_all(&update)?;
+            log(
+                &context.log_tx,
+                LogCategory::Chat,
+                LogLevel::Info,
+                "Sent updated presence after status change",
+            );
+        }
+
         match read_bytes(&mut incoming, &mut buffer)? {
             StreamRead::Data(bytes) => {
                 made_progress = true;
@@ -979,6 +1021,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                             &context.auto_accept_state,
                         )? {
                             HelperCommandResult::NotHelper => {
+                                status_broadcaster.observe_client_content(&content);
                                 forward_client_chat(
                                     &content,
                                     &bytes,
@@ -992,6 +1035,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                             HelperCommandResult::Complete { reply, passthrough } => {
                                 if !passthrough.is_empty() {
                                     let passthrough_content = String::from_utf8_lossy(&passthrough);
+                                    status_broadcaster.observe_client_content(&passthrough_content);
                                     forward_client_chat(
                                         &passthrough_content,
                                         &passthrough,
@@ -1018,6 +1062,7 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
                         if !context.safe_mode.load(Ordering::Relaxed) =>
                     {
                         saw_client_presence = content.contains("<presence");
+                        status_broadcaster.observe_client_content(&content);
                         forward_client_chat(
                             &content,
                             &bytes,
@@ -1539,6 +1584,45 @@ fn forward_client_chat(
     }
 
     Ok(())
+}
+
+struct StatusBroadcaster {
+    last_status: PresenceStatus,
+    last_presence: Option<String>,
+}
+
+impl StatusBroadcaster {
+    fn new(initial_status: PresenceStatus) -> Self {
+        Self {
+            last_status: initial_status,
+            last_presence: None,
+        }
+    }
+
+    fn observe_client_content(&mut self, content: &str) {
+        if presence::contains_unaddressed_presence_fragment(content) {
+            self.last_presence = Some(content.to_string());
+        }
+    }
+
+    fn poll_update(
+        &mut self,
+        status: PresenceStatus,
+        enabled: bool,
+        valorant_version: &mut Option<String>,
+    ) -> Result<Option<Vec<u8>>> {
+        if status == self.last_status {
+            return Ok(None);
+        }
+        self.last_status = status;
+        if !enabled {
+            return Ok(None);
+        }
+        let Some(presence) = self.last_presence.as_deref() else {
+            return Ok(None);
+        };
+        presence::rewrite_unaddressed_presence_only_fragment(presence, status, valorant_version)
+    }
 }
 
 #[cfg(test)]
@@ -2433,7 +2517,10 @@ fn helper_command_reply_for_text(
     } else if command == "opgg" {
         Ok(Some(current_user_opgg_link()?))
     } else if command == "opgg_multi" {
-        Ok(Some(current_lobby_opgg_multisearch_link()?))
+        Ok(Some(match current_lobby_opgg_multisearch_link() {
+            Ok(link) => link,
+            Err(error) => helper_lobby_unavailable_message(&error),
+        }))
     } else if command == "friends_summary" {
         Ok(Some(current_friends_summary()?))
     } else if command == "status" {
@@ -2556,6 +2643,14 @@ fn helper_auto_accept_message(
     Ok(format!("Auto accept is {enabled}. Client state: {state}."))
 }
 
+fn helper_lobby_unavailable_message(error: &anyhow::Error) -> String {
+    if error.to_string().contains("Unable to find lobby members") {
+        "You are not in a League lobby or champ select right now.".to_string()
+    } else {
+        format!("I couldn't get your lobby right now: {error:#}")
+    }
+}
+
 #[cfg(not(test))]
 fn current_user_opgg_link() -> Result<String> {
     tauri::async_runtime::block_on(lcu_api::current_summoner_opgg_link())
@@ -2578,7 +2673,7 @@ fn current_user_opgg_link() -> Result<String> {
 
 #[cfg(test)]
 fn current_lobby_opgg_multisearch_link() -> Result<String> {
-    Ok("https://op.gg/lol/multisearch/na?summoners=Ghosty%23NA1%2CDuo%23NA2".to_string())
+    Ok("https://op.gg/lol/multisearch?summoners=Ghosty%23NA1%2CDuo%23NA2&region=na".to_string())
 }
 
 #[cfg(test)]
@@ -3214,6 +3309,22 @@ mod tests {
     }
 
     #[test]
+    fn league_client_state_tracks_client_processes_independent_of_auto_accept() {
+        assert_eq!(
+            league_client_state_from_processes(&["LeagueClientUx".to_string()]),
+            "Running"
+        );
+        assert_eq!(
+            league_client_state_from_processes(&["RiotClientServices".to_string()]),
+            "Running"
+        );
+        assert_eq!(
+            league_client_state_from_processes(&["VALORANT-Win64-Shipping".to_string()]),
+            "Stopped"
+        );
+    }
+
+    #[test]
     fn stopped_runtime_connection_error_does_not_dirty_reset_health() {
         let running = Arc::new(AtomicBool::new(false));
         let reconnect_attempts = Arc::new(AtomicU32::new(0));
@@ -3489,7 +3600,7 @@ mod tests {
             ),
             (
                 "op.gg multi",
-                "https://op.gg/lol/multisearch/na?summoners=Ghosty%23NA1%2CDuo%23NA2",
+                "https://op.gg/lol/multisearch?summoners=Ghosty%23NA1%2CDuo%23NA2&region=na",
             ),
             (
                 "friends status",
@@ -3520,6 +3631,18 @@ mod tests {
                 } if reply == expected && pass.is_empty()
             ));
         }
+    }
+
+    #[test]
+    fn helper_lobby_unavailable_message_reports_not_in_lobby() {
+        let message = helper_lobby_unavailable_message(&anyhow!(
+            "Unable to find lobby members. Join a League lobby or champ select, then try again."
+        ));
+
+        assert_eq!(
+            message,
+            "You are not in a League lobby or champ select right now."
+        );
     }
 
     #[test]
@@ -4230,6 +4353,39 @@ mod tests {
         assert!(rewritten.contains("<message"));
         assert!(rewritten.contains("<show>offline</show>"));
         assert!(!rewritten.contains("<status>hello</status>"));
+    }
+
+    #[test]
+    fn status_broadcaster_sends_rewritten_presence_after_status_change() {
+        let mut broadcaster = StatusBroadcaster::new(PresenceStatus::Chat);
+        let mut valorant_version = None;
+        broadcaster.observe_client_content(
+            "<presence><show>chat</show><games><league_of_legends><st>chat</st></league_of_legends></games></presence>",
+        );
+
+        let update = broadcaster
+            .poll_update(PresenceStatus::Offline, true, &mut valorant_version)
+            .expect("status update should rewrite")
+            .expect("status update should emit presence");
+        let update = String::from_utf8(update).expect("presence should be utf8");
+
+        assert!(update.contains("<show>offline</show>"));
+        assert!(update.contains("<st>offline</st>"));
+        assert!(broadcaster
+            .poll_update(PresenceStatus::Offline, true, &mut valorant_version)
+            .expect("unchanged status should not fail")
+            .is_none());
+    }
+
+    #[test]
+    fn status_broadcaster_waits_for_client_presence() {
+        let mut broadcaster = StatusBroadcaster::new(PresenceStatus::Chat);
+        let mut valorant_version = None;
+
+        assert!(broadcaster
+            .poll_update(PresenceStatus::Mobile, true, &mut valorant_version)
+            .expect("missing presence should not fail")
+            .is_none());
     }
 
     #[test]

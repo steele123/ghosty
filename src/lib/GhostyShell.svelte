@@ -93,6 +93,7 @@
     autoAccept: boolean;
     autoAcceptDelayMs: number;
     autoAcceptState: string;
+    leagueClientState: string;
     discordWebhookUrl: string;
     status: PresenceStatus;
     startupStatus: StartupStatus;
@@ -154,6 +155,7 @@
     autoAccept: false,
     autoAcceptDelayMs: 2000,
     autoAcceptState: "Disabled",
+    leagueClientState: "Stopped",
     discordWebhookUrl: "",
     status: "offline",
     startupStatus: "last",
@@ -541,7 +543,7 @@
   }
 
   function leagueClientStateLabel() {
-    return snapshot.autoAcceptState.replace(/^Watching:\s*/, "");
+    return snapshot.leagueClientState || "Unavailable";
   }
 
   function autoAcceptDelayLabel(delayMs: number) {
@@ -675,23 +677,6 @@
 </div>
 
 <main class="shell">
-  <header>
-    <div>
-      <h1>Ghosty</h1>
-      <p>Riot presence masking for League, VALORANT, Runeterra, and 2XKO.</p>
-    </div>
-    <div class="header-status">
-      <Badge class={`state-pill ${snapshot.running ? "online" : ""}`} variant="outline">
-        <Activity size={16} />
-        Proxy; {snapshot.running ? "Running" : "Stopped"}
-      </Badge>
-      <Badge class="state-pill client" variant="outline">
-        <ListChecks size={16} />
-        Client State; {leagueClientStateLabel()}
-      </Badge>
-    </div>
-  </header>
-
   {#if error}
     <section class="error">{error}</section>
   {:else if refreshError}
