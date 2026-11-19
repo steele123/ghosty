@@ -1,7 +1,7 @@
 use std::{
     fmt,
     io::{Read, Write},
-    net::{TcpListener, ToSocketAddrs},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, Sender},
@@ -29,6 +29,7 @@ use crate::lcu_api;
 const STREAM_EVENT_PREVIEW_CHARS: usize = 1_400;
 const LOG_BUFFER_LIMIT: usize = 240;
 const STREAM_EVENT_BUFFER_LIMIT: usize = 800;
+const CERT_REFRESH_DAYS: i64 = 20;
 const STARTUP_PRESENCE_REPLAY_IDLE_MS: u64 = 350;
 const STARTUP_PRESENCE_REPLAY_MIN_AGE_MS: u64 = 1_200;
 
@@ -272,6 +273,18 @@ impl AppState {
                 }
             };
 
+            let localhost_dns = check_localhost_resolution();
+            log(
+                &log_tx,
+                LogCategory::System,
+                if localhost_dns.ok {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
+                format!("Localhost DNS: {}", localhost_dns.detail),
+            );
+
             while runtime_running.load(Ordering::Relaxed) {
                 let server = match patched_rx.recv_timeout(Duration::from_millis(200)) {
                     Ok(server) => server,
@@ -311,10 +324,13 @@ impl AppState {
                     &log_tx,
                     LogCategory::Config,
                     LogLevel::Info,
-                    format!(
-                        "Original Riot chat server is {}:{}",
-                        server.host, server.port
-                    ),
+                    match server.fallback_host.as_deref() {
+                        Some(fallback) => format!(
+                            "Riot chat endpoint: {}:{} (original config host fallback: {fallback}:{})",
+                            server.host, server.port, server.port
+                        ),
+                        None => format!("Riot chat endpoint: {}:{}", server.host, server.port),
+                    },
                 );
                 let chat_context = ChatProxyContext {
                     running: runtime_running.clone(),
@@ -899,16 +915,12 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
     let mut incoming = context
         .acceptor
         .accept(incoming)
-        .map_err(|error| anyhow!("incoming Riot Client TLS handshake failed: {error}"))?;
+        .map_err(|error| anyhow!("Local TLS (Riot Client -> Ghosty) handshake failed: {error}"))?;
     incoming
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(250)))?;
 
-    let outgoing_tcp =
-        std::net::TcpStream::connect((context.server.host.as_str(), context.server.port))?;
-    let mut outgoing = TlsConnector::new()?
-        .connect(&context.server.host, outgoing_tcp)
-        .map_err(|error| anyhow!("outgoing Riot chat TLS handshake failed: {error}"))?;
+    let mut outgoing = connect_riot_chat(&context.server, &context.log_tx)?;
     outgoing
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(250)))?;
@@ -1427,6 +1439,69 @@ fn proxy_connection(incoming: std::net::TcpStream, context: ChatProxyContext) ->
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn connect_riot_chat(
+    server: &PatchedChatServer,
+    log_tx: &Sender<LogEntry>,
+) -> Result<TlsStream<TcpStream>> {
+    let connector = TlsConnector::new()?;
+    let mut last_error = None;
+    for host in std::iter::once(server.host.as_str()).chain(server.fallback_host.as_deref()) {
+        let attempt = (|| -> Result<TlsStream<TcpStream>> {
+            let addresses = (host, server.port)
+                .to_socket_addrs()
+                .with_context(|| format!("Unable to resolve Riot chat host {host}"))?;
+            let mut connect_error = None;
+            let mut socket = None;
+            for address in addresses {
+                match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+                    Ok(connected) => {
+                        socket = Some(connected);
+                        break;
+                    }
+                    Err(error) => connect_error = Some(error),
+                }
+            }
+            let socket = socket.ok_or_else(|| {
+                anyhow!(
+                    "Unable to connect to Riot chat host {host}: {}",
+                    connect_error.map_or_else(
+                        || "no addresses returned".to_string(),
+                        |error| error.to_string()
+                    )
+                )
+            })?;
+            socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+            socket.set_write_timeout(Some(Duration::from_secs(10)))?;
+            connector
+                .connect(host, socket)
+                .map_err(|error| anyhow!("Riot chat TLS handshake with {host} failed: {error}"))
+        })();
+        match attempt {
+            Ok(connection) => {
+                if host != server.host {
+                    log(
+                        log_tx,
+                        LogCategory::Chat,
+                        LogLevel::Warn,
+                        format!("Connected to Riot chat via original config host {host} after affinity host failed"),
+                    );
+                }
+                return Ok(connection);
+            }
+            Err(error) => {
+                log(
+                    log_tx,
+                    LogCategory::Chat,
+                    LogLevel::Warn,
+                    format!("Riot chat endpoint {host}: {error:#}"),
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("No Riot chat host is available")))
 }
 
 fn log_client_hello(stream: &std::net::TcpStream, log_tx: &Sender<LogEntry>) {
@@ -2678,22 +2753,31 @@ struct LadderCutoffResponse {
 struct LadderCutoffQueue {
     grandmaster_cutoff_lp: i32,
     challenger_cutoff_lp: i32,
-    total_masters: i32,
     last_updated: String,
 }
 
 fn format_ladder_cutoff_message(region: &str, cutoff: &LadderCutoffResponse) -> String {
+    let updated_at = format_ladder_cutoff_updated_at(&cutoff.solo_queue.last_updated);
     format!(
-        "{} cutoffs: Solo GM {} LP, Challenger {} LP, Masters {}; Flex GM {} LP, Challenger {} LP, Masters {}. Updated {}.",
+        "{} cutoffs:\nSolo: GM {} LP, Challenger {} LP\nFlex: GM {} LP, Challenger {} LP\nUpdated: {}",
         region.to_ascii_uppercase(),
         cutoff.solo_queue.grandmaster_cutoff_lp,
         cutoff.solo_queue.challenger_cutoff_lp,
-        cutoff.solo_queue.total_masters,
         cutoff.flex_queue.grandmaster_cutoff_lp,
         cutoff.flex_queue.challenger_cutoff_lp,
-        cutoff.flex_queue.total_masters,
-        cutoff.solo_queue.last_updated
+        updated_at
     )
+}
+
+fn format_ladder_cutoff_updated_at(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|updated_at| {
+            updated_at
+                .with_timezone(&chrono::Utc)
+                .format("%b %d, %Y %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.to_string())
 }
 
 #[cfg(not(test))]
@@ -2775,7 +2859,7 @@ fn current_friends_summary() -> Result<String> {
 
 #[cfg(test)]
 fn current_ladder_cutoff_message() -> Result<String> {
-    Ok("NA1 cutoffs: Solo GM 876 LP, Challenger 1312 LP, Masters 10000; Flex GM 400 LP, Challenger 1099 LP, Masters 1241. Updated 2026-07-06T05:12:30.1369242Z.".to_string())
+    Ok("NA1 cutoffs:\nSolo: GM 876 LP, Challenger 1312 LP\nFlex: GM 400 LP, Challenger 1099 LP\nUpdated: Jul 06, 2026 05:12 UTC".to_string())
 }
 
 fn helper_status_label(status: PresenceStatus) -> &'static str {
@@ -2925,20 +3009,139 @@ fn message_body_text(element: &xmltree::Element) -> Option<String> {
 }
 
 fn proxy_identity(log_tx: &Sender<LogEntry>) -> Result<Identity> {
-    if let Some(bytes) = persistence::read_certificate() {
-        match Identity::from_pkcs12(&bytes, "") {
-            Ok(identity) => return Ok(identity),
-            Err(error) => log(
+    let cached =
+        persistence::read_certificate().and_then(|bytes| match validated_proxy_identity(&bytes) {
+            Ok(validated) => Some(validated),
+            Err(error) => {
+                log(
+                    log_tx,
+                    LogCategory::System,
+                    LogLevel::Warn,
+                    format!("Cached proxy certificate failed TLS validation: {error:#}"),
+                );
+                None
+            }
+        });
+
+    if let Some((identity, valid_until)) = &cached {
+        if !certificate_needs_refresh(*valid_until, chrono::Utc::now()) {
+            log(
                 log_tx,
                 LogCategory::System,
-                LogLevel::Warn,
-                format!("Cached localhost proxy certificate is invalid; redownloading: {error}"),
-            ),
+                LogLevel::Info,
+                format!(
+                    "Using cached proxy certificate; valid until {}",
+                    certificate_date(*valid_until)
+                ),
+            );
+            return Ok(identity.clone());
         }
+        log(
+            log_tx,
+            LogCategory::System,
+            LogLevel::Info,
+            format!(
+                "Proxy certificate expires {}; refreshing within {CERT_REFRESH_DAYS}-day window",
+                certificate_date(*valid_until)
+            ),
+        );
     }
 
-    let bytes = download_proxy_certificate(log_tx)?;
-    Identity::from_pkcs12(&bytes, "").context("Unable to decode localhost.pfx")
+    let refreshed = download_proxy_certificate(log_tx).and_then(|bytes| {
+        let (identity, valid_until) = validated_proxy_identity(&bytes)
+            .context("Downloaded proxy certificate failed TLS validation")?;
+        Ok((bytes, identity, valid_until))
+    });
+
+    match refreshed {
+        Ok((bytes, identity, valid_until)) => {
+            if let Some((cached_identity, cached_until)) = cached {
+                if valid_until <= cached_until {
+                    log(
+                        log_tx,
+                        LogCategory::System,
+                        LogLevel::Warn,
+                        format!("Downloaded proxy certificate is not newer (expires {}); using cached certificate until {}", certificate_date(valid_until), certificate_date(cached_until)),
+                    );
+                    return Ok(cached_identity);
+                }
+            }
+            if let Err(error) = persistence::write_certificate(&bytes) {
+                log(
+                    log_tx,
+                    LogCategory::System,
+                    LogLevel::Warn,
+                    format!("Proxy certificate is valid but could not be cached: {error:#}"),
+                );
+            }
+            log(
+                log_tx,
+                LogCategory::System,
+                LogLevel::Info,
+                format!(
+                    "Using refreshed proxy certificate; valid until {}",
+                    certificate_date(valid_until)
+                ),
+            );
+            Ok(identity)
+        }
+        Err(error) => match cached {
+            Some((identity, valid_until)) => {
+                log(
+                    log_tx,
+                    LogCategory::System,
+                    LogLevel::Warn,
+                    format!("Proxy certificate refresh failed; using cached certificate until {}: {error:#}", certificate_date(valid_until)),
+                );
+                Ok(identity)
+            }
+            None => Err(error.context("No valid proxy certificate is available")),
+        },
+    }
+}
+
+fn certificate_needs_refresh(
+    valid_until: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    valid_until <= now + chrono::Duration::days(CERT_REFRESH_DAYS)
+}
+
+fn certificate_date(valid_until: chrono::DateTime<chrono::Utc>) -> String {
+    valid_until.format("%b %d, %Y %H:%M UTC").to_string()
+}
+
+fn validated_proxy_identity(bytes: &[u8]) -> Result<(Identity, chrono::DateTime<chrono::Utc>)> {
+    let identity = Identity::from_pkcs12(bytes, "").context("Unable to decode localhost.pfx")?;
+    let acceptor = TlsAcceptor::builder(identity.clone())
+        .min_protocol_version(Some(Protocol::Tlsv12))
+        .build()?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let client = TcpStream::connect(listener.local_addr()?)?;
+    let (server, _) = listener.accept()?;
+    client.set_read_timeout(Some(Duration::from_secs(5)))?;
+    client.set_write_timeout(Some(Duration::from_secs(5)))?;
+    server.set_read_timeout(Some(Duration::from_secs(5)))?;
+    server.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    let connector = TlsConnector::new()?;
+    let server_handshake = thread::spawn(move || acceptor.accept(server));
+    let client_result = connector.connect(LOCALHOST_DOMAIN, client);
+    let server_result = server_handshake
+        .join()
+        .map_err(|_| anyhow!("Local proxy TLS validation thread panicked"))?;
+    let client_connection =
+        client_result.map_err(|error| anyhow!("Local proxy certificate was rejected: {error}"))?;
+    server_result.map_err(|error| anyhow!("Local proxy TLS handshake failed: {error}"))?;
+    let certificate = client_connection
+        .peer_certificate()?
+        .ok_or_else(|| anyhow!("Local proxy TLS handshake returned no certificate"))?;
+    let der = certificate.to_der()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(&der)
+        .map_err(|error| anyhow!("Unable to read proxy certificate expiry: {error}"))?;
+    let valid_until = chrono::DateTime::from_timestamp(parsed.validity().not_after.timestamp(), 0)
+        .ok_or_else(|| anyhow!("Proxy certificate expiry is outside the supported date range"))?;
+    Ok((identity, valid_until))
 }
 
 fn download_proxy_certificate(log_tx: &Sender<LogEntry>) -> Result<Vec<u8>> {
@@ -2948,14 +3151,15 @@ fn download_proxy_certificate(log_tx: &Sender<LogEntry>) -> Result<Vec<u8>> {
         LogLevel::Info,
         "Downloading localhost proxy certificate",
     );
-    let bytes = reqwest::blocking::Client::new()
+    let bytes = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?
         .get("https://mln.cx/deceive/localhost.pfx")
         .header("User-Agent", "Ghosty/0.1.0")
         .send()?
         .error_for_status()?
         .bytes()?
         .to_vec();
-    persistence::write_certificate(&bytes)?;
     Ok(bytes)
 }
 
@@ -3164,16 +3368,21 @@ fn check_certificate() -> PreflightCheck {
 
 fn certificate_check(bytes: Option<&[u8]>) -> PreflightCheck {
     match bytes {
-        Some(bytes) if Identity::from_pkcs12(bytes, "").is_ok() => PreflightCheck {
-            label: "Proxy Certificate".to_string(),
-            ok: true,
-            detail: "Cached localhost certificate loads correctly".to_string(),
-        },
-        Some(_) => PreflightCheck {
-            label: "Proxy Certificate".to_string(),
-            ok: false,
-            detail: "Cached localhost certificate is invalid; Ghosty will redownload it on start"
-                .to_string(),
+        Some(bytes) => match validated_proxy_identity(bytes) {
+            Ok((_, valid_until)) => PreflightCheck {
+                label: "Proxy Certificate".to_string(),
+                ok: true,
+                detail: if certificate_needs_refresh(valid_until, chrono::Utc::now()) {
+                    format!("Cached certificate expires {}; Ghosty will refresh it on start", certificate_date(valid_until))
+                } else {
+                    format!("Cached certificate is valid until {}", certificate_date(valid_until))
+                },
+            },
+            Err(error) => PreflightCheck {
+                label: "Proxy Certificate".to_string(),
+                ok: false,
+                detail: format!("Cached certificate is invalid; Ghosty will redownload it on start: {error:#}"),
+            },
         },
         None => PreflightCheck {
             label: "Proxy Certificate".to_string(),
@@ -3571,6 +3780,23 @@ mod tests {
     }
 
     #[test]
+    fn certificate_refresh_window_starts_twenty_days_before_expiry() {
+        let now = chrono::Utc::now();
+        assert!(!certificate_needs_refresh(
+            now + chrono::Duration::days(21),
+            now
+        ));
+        assert!(certificate_needs_refresh(
+            now + chrono::Duration::days(20),
+            now
+        ));
+        assert!(certificate_needs_refresh(
+            now - chrono::Duration::days(1),
+            now
+        ));
+    }
+
+    #[test]
     fn helper_command_reply_reads_message_body_only() {
         let enabled = Arc::new(AtomicBool::new(true));
         let status = Arc::new(Mutex::new(PresenceStatus::Chat));
@@ -3702,7 +3928,7 @@ mod tests {
             ),
             (
                 "cutoff",
-                "NA1 cutoffs: Solo GM 876 LP, Challenger 1312 LP, Masters 10000; Flex GM 400 LP, Challenger 1099 LP, Masters 1241. Updated 2026-07-06T05:12:30.1369242Z.",
+                "NA1 cutoffs:\nSolo: GM 876 LP, Challenger 1312 LP\nFlex: GM 400 LP, Challenger 1099 LP\nUpdated: Jul 06, 2026 05:12 UTC",
             ),
         ];
 
@@ -3752,8 +3978,13 @@ mod tests {
 
         assert_eq!(
             format_ladder_cutoff_message("na1", &cutoff),
-            "NA1 cutoffs: Solo GM 876 LP, Challenger 1312 LP, Masters 10000; Flex GM 400 LP, Challenger 1099 LP, Masters 1241. Updated 2026-07-06T05:12:30.1369242Z."
+            "NA1 cutoffs:\nSolo: GM 876 LP, Challenger 1312 LP\nFlex: GM 400 LP, Challenger 1099 LP\nUpdated: Jul 06, 2026 05:12 UTC"
         );
+    }
+
+    #[test]
+    fn ladder_cutoff_updated_at_falls_back_to_raw_value() {
+        assert_eq!(format_ladder_cutoff_updated_at("not-a-date"), "not-a-date");
     }
 
     #[test]

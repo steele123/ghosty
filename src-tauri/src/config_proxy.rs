@@ -37,6 +37,7 @@ pub struct PatchedChatServer {
     pub host: String,
     pub port: u16,
     pub affinity: Option<String>,
+    pub fallback_host: Option<String>,
 }
 
 pub fn start(
@@ -427,14 +428,15 @@ fn rewrite_config_with_affinity(
         .map(ToOwned::to_owned);
     let original_port = json.get("chat.port").and_then(chat_port_value);
     let affinity_host = affinity_host(json, affinity, original_host.is_none());
-    let server = affinity_host
-        .or(original_host)
-        .zip(original_port)
-        .map(|(host, port)| PatchedChatServer {
-            host,
-            port,
-            affinity: affinity.map(ToOwned::to_owned),
-        })?;
+    let host = affinity_host.or_else(|| original_host.clone())?;
+    let port = original_port?;
+    let fallback_host = original_host.filter(|original| original != &host);
+    let server = PatchedChatServer {
+        host,
+        port,
+        affinity: affinity.map(ToOwned::to_owned),
+        fallback_host,
+    };
 
     if json.get("chat.host").is_some() {
         json["chat.host"] = Value::String(LOCALHOST_DOMAIN.to_string());
@@ -921,6 +923,7 @@ mod tests {
                 host: "na2.chat.si.riotgames.com".to_string(),
                 port: 5223,
                 affinity: None,
+                fallback_host: None,
             },
         );
 
@@ -939,6 +942,7 @@ mod tests {
                 host: "na2.chat.si.riotgames.com".to_string(),
                 port: 5223,
                 affinity: None,
+                fallback_host: None,
             },
         );
 
@@ -1101,10 +1105,32 @@ mod tests {
             .expect("server should be detected");
 
         assert_eq!(server.host, "na2.chat.si.riotgames.com");
+        assert_eq!(server.fallback_host, None);
         assert_eq!(server.affinity.as_deref(), Some("na1"));
         assert_eq!(server.port, 5223);
         assert_eq!(config["chat.host"], LOCALHOST_DOMAIN);
         assert_eq!(config["chat.affinities"]["na1"], LOCALHOST_DOMAIN);
+    }
+
+    #[test]
+    fn rewrite_config_retains_original_host_when_affinity_host_differs() {
+        let mut config = json!({
+            "chat.host": "na2.chat.si.riotgames.com",
+            "chat.port": 5223,
+            "chat.affinities": {
+                "na1": "na1.chat.si.riotgames.com"
+            }
+        });
+
+        let server = rewrite_config_with_affinity(&mut config, 49232, Some("na1"))
+            .expect("server should be detected");
+
+        assert_eq!(server.host, "na1.chat.si.riotgames.com");
+        assert_eq!(
+            server.fallback_host.as_deref(),
+            Some("na2.chat.si.riotgames.com")
+        );
+        assert_eq!(config["chat.host"], LOCALHOST_DOMAIN);
     }
 
     #[test]
